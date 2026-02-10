@@ -1,0 +1,70 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Live 图查看器</title>
+<link rel="stylesheet" href="vendor/viewer.min.css" />
+<link rel="stylesheet" href="src/css/app.css" />
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <h1>Live 图查看器</h1>
+      <span>模块化 · 离线 · 相册式体验</span>
+    </div>
+    <div class="actions">
+      <input id="filePicker" aria-label="FILE_PICKER" class="mcp-hidden" type="file" accept="image/*,video/*" multiple />
+      <input id="dirPicker" aria-label="DIR_PICKER" class="mcp-hidden" type="file" webkitdirectory multiple />
+      <input id="mcpFiles" aria-label="MCP_FILES" class="mcp-hidden" type="file" multiple />
+      <button id="folderBtn" class="icon-btn primary" data-icon="folder" title="选择文件夹" aria-label="选择文件夹"></button>
+      <button id="exportBtn" class="icon-btn" data-icon="download" title="导出选中" aria-label="导出选中" disabled></button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="toolbar">
+    <div class="search-card">
+      <div class="row">
+        <button id="filterAll" class="ghost">全部</button>
+        <button id="filterLive" class="ghost">仅 Live</button>
+        <button id="filterStill" class="ghost">非 Live</button>
+        <button id="clearSel" class="ghost">清空选择</button>
+        <label class="sort-wrap">
+          排序
+          <select id="sortSelect">
+            <option value="mtime_desc">文件时间（新→旧）</option>
+            <option value="mtime_asc">文件时间（旧→新）</option>
+            <option value="shot_desc">拍摄时间（新→旧）</option>
+            <option value="shot_asc">拍摄时间（旧→新）</option>
+            <option value="name_asc">文件名（A→Z）</option>
+            <option value="name_desc">文件名（Z→A）</option>
+            <option value="size_desc">文件大小（大→小）</option>
+            <option value="size_asc">文件大小（小→大）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row stat" id="stats">未加载文件</div>
+      <div class="row stat" id="status">等待导入</div>
+    </div>
+  </section>
+
+  <section id="grid" class="grid"></section>
+</main>
+
+<div id="viewerGallery" style="display:none;"></div>
+<div id="liveOverlay" class="live-video-overlay" role="dialog" aria-modal="true">
+  <div class="live-video-card">
+    <button id="liveClose" class="live-video-close" aria-label="关闭"></button>
+    <video id="liveVideo" playsinline muted></video>
+  </div>
+</div>
+
+<script src="vendor/viewer.min.js"></script>
+<script src="src/js/app.js"></script>
+</body>
+</html>
+
+
