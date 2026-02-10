@@ -1,4 +1,4 @@
-﻿const state = {
+const state = {
   files: [],
   items: [],
   filtered: [],
@@ -222,7 +222,7 @@ async function pickDirectoryByPlatform() {
       return files;
     } catch (err) {
       console.debug('[dir-pick] showDirectoryPicker cancel/error', err);
-      return [];
+      if (err && err.name === 'AbortError') return [];
     }
   }
   if (supportsWebkitDir) {
