@@ -720,3 +720,58 @@ body.desktop .grid { grid-template-columns: repeat(auto-fill, minmax(var(--thumb
   background-position: center;
   background-size: 16px 16px;
 }
+
+.scan-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 12, 20, 0.46);
+  backdrop-filter: blur(2px);
+}
+.scan-overlay.hidden {
+  display: none;
+}
+.scan-card {
+  width: min(86vw, 440px);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  padding: 16px 16px 14px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.35);
+}
+.scan-spinner {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.25);
+  border-top-color: #fff;
+  animation: scan-spin .8s linear infinite;
+  margin: 0 auto 10px;
+}
+.scan-text {
+  font-size: 13px;
+  text-align: center;
+  color: rgba(255,255,255,0.9);
+}
+.scan-bar {
+  margin-top: 10px;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.2);
+  overflow: hidden;
+}
+.scan-bar-inner {
+  width: 0%;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #6fb6ff 0%, #39d98a 100%);
+  transition: width .18s ease;
+}
+@keyframes scan-spin {
+  to { transform: rotate(360deg); }
+}

@@ -1324,3 +1324,395 @@ const TAGS = {
   0xA002: 'ImageWidth',
   0xA003: 'ImageHeight'
 };
+
+// Performance + detection + detail panel overrides
+Object.assign(TAGS, {
+  0x0001: 'GPSLatitudeRef',
+  0x0002: 'GPSLatitude',
+  0x0003: 'GPSLongitudeRef',
+  0x0004: 'GPSLongitude',
+});
+
+function formatGps(exif) {
+  const lat = exif.GPSLatitude;
+  const lon = exif.GPSLongitude;
+  if (!Array.isArray(lat) || !Array.isArray(lon) || lat.length < 3 || lon.length < 3) return null;
+  const toDeg = (arr, ref) => {
+    const d = Number(arr[0]);
+    const m = Number(arr[1]);
+    const s = Number(arr[2]);
+    if (![d, m, s].every(Number.isFinite)) return null;
+    let out = d + m / 60 + s / 3600;
+    if (ref === 'S' || ref === 'W') out = -out;
+    return out;
+  };
+  const latDeg = toDeg(lat, exif.GPSLatitudeRef);
+  const lonDeg = toDeg(lon, exif.GPSLongitudeRef);
+  if (!Number.isFinite(latDeg) || !Number.isFinite(lonDeg)) return null;
+  return `${latDeg.toFixed(6)}, ${lonDeg.toFixed(6)}`;
+}
+
+function buildDetailRows(item) {
+  const exif = item.exif || {};
+  const gps = formatGps(exif);
+  return [
+    ['文件名', item.name || '-'],
+    ['类型', item.isLive ? 'Live Photo' : '静态图片'],
+    ['厂商', item.isLive ? item.liveType : '-'],
+    ['拍摄时间', exif.DateTimeOriginal || exif.DateTime || '-'],
+    ['机型', exif.Model || '-'],
+    ['厂商名', exif.Make || '-'],
+    ['镜头', exif.LensModel || '-'],
+    ['尺寸', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
+    ['定位', gps || '-'],
+  ];
+}
+
+function parseXmpNumber(xmp, key) {
+  const match = xmp.match(new RegExp(`${key}[^\\d]*(\\d+)`, 'i'));
+  if (!match) return null;
+  const num = Number(match[1]);
+  return Number.isFinite(num) ? num : null;
+}
+
+function extractEmbeddedVideo(buf, xmpOffset = null) {
+  const bytes = new Uint8Array(buf);
+  const minBytes = 200 * 1024;
+  const candidates = [];
+
+  if (Number.isFinite(xmpOffset) && xmpOffset > 0) {
+    const fromStart = xmpOffset;
+    const fromEnd = bytes.length - xmpOffset;
+    if (fromStart < bytes.length - 12) candidates.push(fromStart);
+    if (fromEnd > 0 && fromEnd < bytes.length - 12) candidates.push(fromEnd);
+  }
+
+  if (!candidates.length) {
+    for (let i = 0; i < bytes.length - 12; i++) {
+      if (bytes[i + 4] === 0x66 && bytes[i + 5] === 0x74 && bytes[i + 6] === 0x79 && bytes[i + 7] === 0x70) {
+        candidates.push(i);
+        break;
+      }
+    }
+  }
+
+  for (const offset of candidates) {
+    const video = bytes.slice(offset);
+    if (video.length < minBytes) continue;
+    if (video[4] === 0x66 && video[5] === 0x74 && video[6] === 0x79 && video[7] === 0x70) {
+      return new Blob([video], { type: 'video/mp4' });
+    }
+  }
+  return null;
+}
+
+async function readHeadBytes(file, size) {
+  const slice = file.slice(0, Math.min(size, file.size));
+  return slice.arrayBuffer();
+}
+
+async function scanFiles(files) {
+  const items = [];
+  const byBase = new Map();
+  for (const f of files) {
+    const base = f.name.replace(/\.[^/.]+$/, '').toLowerCase();
+    if (!byBase.has(base)) byBase.set(base, []);
+    byBase.get(base).push(f);
+  }
+
+  const queue = files.filter(f => f.type.startsWith('image/'));
+  const concurrency = 4;
+  for (let start = 0; start < queue.length; start += concurrency) {
+    const chunk = queue.slice(start, start + concurrency);
+    const chunkItems = await Promise.all(chunk.map(file => analyzeFile(file, byBase)));
+    items.push(...chunkItems);
+    if (start % 20 === 0) {
+      setStatus(`Scanning ${Math.min(start + chunk.length, queue.length)}/${queue.length}...`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return items;
+}
+
+function analyzeFile(file, byBase) {
+  return (async () => {
+    const id = crypto.randomUUID();
+    const item = { id, name: file.name, file, isLive: false, liveType: 'Still', videoBlob: null, thumbLoaded: false, exif: null, exifTime: null, exifChecked: false, objectUrl: null };
+    const base = file.name.replace(/\.[^/.]+$/, '').toLowerCase();
+    const siblings = byBase.get(base) || [];
+
+    const mov = siblings.find(f => f.name.toLowerCase().endsWith('.mov'));
+    if (mov) {
+      item.isLive = true;
+      item.liveType = 'iOS Live Photo';
+      item.videoBlob = mov.type ? mov : new Blob([mov], { type: 'video/quicktime' });
+      return item;
+    }
+
+    try {
+      const head = await readHeadBytes(file, 1024 * 1024);
+      const xmp = extractXmp(head);
+      const exif = extractExif(head);
+      item.exifChecked = true;
+      if (exif && Object.keys(exif).length) {
+        item.exif = exif;
+        item.exifTime = parseExifTime(exif);
+      }
+
+      let vendorType = null;
+      let hasMotionTag = false;
+      let microOffset = null;
+      if (xmp) {
+        hasMotionTag = /MotionPhoto/i.test(xmp) || /MicroVideo/i.test(xmp);
+        microOffset = parseXmpNumber(xmp, 'MicroVideoOffset');
+        if (/Xiaomi|xiaomi/i.test(xmp)) vendorType = 'Xiaomi Live Photo';
+        if (/vivo/i.test(xmp)) vendorType = 'vivo Live Photo';
+        if (/OPPO|oppo/i.test(xmp)) vendorType = 'OPPO Live Photo';
+        if (/HONOR|honor/i.test(xmp)) vendorType = 'HONOR Live Photo';
+      }
+
+      if (hasMotionTag || microOffset != null || file.size < 12 * 1024 * 1024) {
+        const full = await file.arrayBuffer();
+        const videoBlob = extractEmbeddedVideo(full, microOffset);
+        if (videoBlob) {
+          item.isLive = true;
+          item.liveType = vendorType || (hasMotionTag ? 'Google Motion Photo' : 'Embedded Video');
+          item.videoBlob = videoBlob;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return item;
+  })();
+}
+
+function readTagValue(view, type, count, valueOffset, little, base) {
+  const typeSizes = { 1:1, 2:1, 3:2, 4:4, 5:8, 7:1 };
+  const size = (typeSizes[type] || 1) * count;
+  let offset = size <= 4 ? valueOffset : base + view.getUint32(valueOffset, little);
+  if (offset + size > view.byteLength) return null;
+  if (type === 2) {
+    const bytes = new Uint8Array(view.buffer, offset, count);
+    return new TextDecoder().decode(bytes).replace(/\0/g, '').trim();
+  }
+  if (type === 3) {
+    if (count <= 1) return view.getUint16(offset, little);
+    const out = [];
+    for (let i = 0; i < count; i++) out.push(view.getUint16(offset + i * 2, little));
+    return out;
+  }
+  if (type === 4) {
+    if (count <= 1) return view.getUint32(offset, little);
+    const out = [];
+    for (let i = 0; i < count; i++) out.push(view.getUint32(offset + i * 4, little));
+    return out;
+  }
+  if (type === 5) {
+    const readRational = (off) => {
+      const num = view.getUint32(off, little);
+      const den = view.getUint32(off + 4, little);
+      return den ? (num / den) : num;
+    };
+    if (count <= 1) return readRational(offset);
+    const out = [];
+    for (let i = 0; i < count; i++) out.push(readRational(offset + i * 8));
+    return out;
+  }
+  return null;
+}
+
+// Scan overlay + incremental grid rendering overrides
+(function () {
+  if (!state.itemById) state.itemById = new Map();
+
+  function ensureScanOverlay() {
+    let mask = document.getElementById('scanOverlay');
+    if (mask) return mask;
+    mask = document.createElement('div');
+    mask.id = 'scanOverlay';
+    mask.className = 'scan-overlay hidden';
+    mask.innerHTML = '<div class="scan-card"><div class="scan-spinner" aria-hidden="true"></div><div id="scanText" class="scan-text">Scanning...</div><div class="scan-bar"><div id="scanBar" class="scan-bar-inner"></div></div></div>';
+    document.body.appendChild(mask);
+    return mask;
+  }
+
+  function showScanOverlay() {
+    const mask = ensureScanOverlay();
+    mask.classList.remove('hidden');
+  }
+
+  function hideScanOverlay() {
+    const mask = ensureScanOverlay();
+    mask.classList.add('hidden');
+  }
+
+  function updateScanOverlay(done, total, label) {
+    const mask = ensureScanOverlay();
+    const txt = mask.querySelector('#scanText');
+    const bar = mask.querySelector('#scanBar');
+    const safeTotal = total > 0 ? total : 1;
+    const pct = Math.max(0, Math.min(100, Math.round((done / safeTotal) * 100)));
+    if (txt) txt.textContent = `${label || 'Scanning'} ${done}/${total} (${pct}%)`;
+    if (bar) bar.style.width = `${pct}%`;
+  }
+
+  async function scanFilesWithProgress(files) {
+    const items = [];
+    const byBase = new Map();
+    for (const f of files) {
+      const base = f.name.replace(/\.[^/.]+$/, '').toLowerCase();
+      if (!byBase.has(base)) byBase.set(base, []);
+      byBase.get(base).push(f);
+    }
+
+    const queue = files.filter(f => f.type.startsWith('image/'));
+    const total = queue.length;
+    const concurrency = 6;
+    let done = 0;
+
+    updateScanOverlay(0, total, 'Scanning');
+    for (let start = 0; start < queue.length; start += concurrency) {
+      const chunk = queue.slice(start, start + concurrency);
+      const chunkItems = await Promise.all(chunk.map(file => analyzeFile(file, byBase)));
+      items.push(...chunkItems);
+      done += chunk.length;
+      updateScanOverlay(done, total, 'Scanning');
+      if (done % 24 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    return items;
+  }
+
+  async function startScanOverride() {
+    if (!state.files.length || state.scanning) return;
+    state.scanning = true;
+    showScanOverlay();
+    setStatus('Scanning...');
+
+    if (state.items.length) {
+      state.items.forEach((item) => {
+        if (item.objectUrl) {
+          URL.revokeObjectURL(item.objectUrl);
+          item.objectUrl = null;
+        }
+        if (item.thumbUrl) {
+          URL.revokeObjectURL(item.thumbUrl);
+          item.thumbUrl = null;
+        }
+      });
+    }
+
+    state.items = await scanFilesWithProgress(state.files);
+    state.itemById = new Map(state.items.map(i => [i.id, i]));
+    renderGrid();
+    updateStats();
+    state.scanning = false;
+    hideScanOverlay();
+    setStatus('Scan complete');
+  }
+
+  function loadThumbnailOverride(item, card) {
+    try {
+      const holder = card.querySelector('.thumb');
+      if (!holder || holder.querySelector('img')) return;
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
+      img.src = item.objectUrl;
+      holder.textContent = '';
+      holder.appendChild(img);
+      item.thumbLoaded = true;
+    } catch {
+      // leave placeholder
+    }
+  }
+
+  function renderGridOverride(options = {}) {
+    const { skipGallery = false } = options;
+    if (renderTimer) {
+      clearTimeout(renderTimer);
+      renderTimer = null;
+    }
+
+    el.grid.innerHTML = '';
+    bindGridEvents();
+
+    const list = state.items.filter(i => state.filter === 'all' || (state.filter === 'live' ? i.isLive : !i.isLive));
+    const sorted = applySort(list);
+    state.filtered = sorted;
+    if (!skipGallery) updateViewerGallery();
+
+    const map = state.itemById && state.itemById.size ? state.itemById : new Map(state.items.map(i => [i.id, i]));
+    state.itemById = map;
+
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const id = entry.target.getAttribute('data-id');
+        const item = map.get(id);
+        if (item) loadThumbnailOverride(item, entry.target);
+        observer.unobserve(entry.target);
+      }
+    }, { rootMargin: '200px' });
+
+    const groups = buildGroups(sorted);
+    let index = 0;
+    const chunkSize = 180;
+
+    const renderChunk = () => {
+      const frag = document.createDocumentFragment();
+      let count = 0;
+      while (index < groups.length && count < chunkSize) {
+        const entry = groups[index++];
+        count++;
+        if (entry.type === 'group') {
+          const header = document.createElement('div');
+          header.className = 'group-header';
+          header.textContent = entry.label;
+          frag.appendChild(header);
+          continue;
+        }
+
+        const item = entry.item;
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.dataset.id = item.id;
+        if (state.selection.has(item.id)) card.classList.add('selected');
+
+        const thumb = document.createElement('div');
+        thumb.className = 'thumb';
+        thumb.textContent = 'Loading...';
+
+        if (item.isLive) {
+          const badge = document.createElement('div');
+          badge.className = 'live-icon';
+          badge.title = 'Live Photo';
+          card.appendChild(badge);
+        }
+
+        const check = document.createElement('div');
+        check.className = 'check';
+        check.textContent = state.selection.has(item.id) ? '✓' : '';
+
+        card.appendChild(thumb);
+        card.appendChild(check);
+        frag.appendChild(card);
+        observer.observe(card);
+      }
+
+      el.grid.appendChild(frag);
+      if (index < groups.length) {
+        requestAnimationFrame(renderChunk);
+      }
+    };
+
+    requestAnimationFrame(renderChunk);
+  }
+
+  startScan = startScanOverride;
+  renderGrid = renderGridOverride;
+  loadThumbnail = loadThumbnailOverride;
+})();

@@ -1,2 +1,4 @@
 mcp-bundle.json
-\tools\mcp-pack.ps1
+/build
+/test
+/docs
