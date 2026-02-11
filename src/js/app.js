@@ -13,9 +13,11 @@
   exifQueueRunning: false,
   userAdjusted: false,
   viewerUrlCache: new Map(),
+  currentViewerIndex: -1,
 };
 const EXIF_SLICE_SIZE = 256 * 1024;
 let renderTimer = null;
+const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 
 const el = {
   filePicker: document.getElementById('filePicker'),
@@ -110,7 +112,7 @@ function setFilter(f) {
 async function handleSelectedFiles(files, source) {
   if (!files || !files.length) return;
   if (files.length >= 1 && files.every(isBundleFile)) {
-    setStatus('妫€娴嬪埌 MCP bundle锛屽姞杞戒腑...');
+    setStatus('MCP bundle detected, loading...');
     let loadedAll = [];
     for (const f of files) {
       const loaded = await loadBundle(f);
@@ -118,20 +120,20 @@ async function handleSelectedFiles(files, source) {
     }
     if (loadedAll.length) {
       state.files = loadedAll;
-      setStatus(`宸查€氳繃 MCP bundle 瀵煎叆锛屽叡 ${state.files.length} 涓枃浠禶);
+      setStatus(`Imported from MCP bundle: ${state.files.length} files`);
       startScan();
     } else {
-      setStatus('MCP bundle 鍔犺浇澶辫触');
+      setStatus('Failed to load MCP bundle');
     }
     return;
   }
   state.files = files;
   if (source === 'dir') {
-    setStatus(`宸查€夋嫨鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
+    setStatus(`Folder selected: ${state.files.length} files`);
   } else if (source === 'mcp') {
-    setStatus(`宸查€氳繃 MCP 瀵煎叆鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
+    setStatus(`Imported via MCP: ${state.files.length} files`);
   } else {
-    setStatus(`宸查€夋嫨 ${state.files.length} 涓枃浠讹紝鑷姩鎵弿涓?..`);
+    setStatus(`Selected ${state.files.length} files, scanning...`);
   }
   startScan();
 }
@@ -254,11 +256,11 @@ el.folderBtn.addEventListener('click', async () => {
 el.exportBtn.addEventListener('click', async () => {
   const selected = state.items.filter(i => state.selection.has(i.id) && i.isLive);
   if (!selected.length) return;
-  setStatus(`瀵煎嚭 ${selected.length} 涓」鐩腑...`);
+  setStatus(`Exporting ${selected.length} item(s)...`);
   for (const item of selected) {
     await exportItem(item);
   }
-  setStatus('瀵煎嚭瀹屾垚锛堣嫢娴忚鍣ㄩ樆姝笅杞斤紝璇峰厑璁稿鏂囦欢涓嬭浇锛?);
+  setStatus('Export complete');
 });
 
 // MCP 璋冭瘯鍏ュ彛锛氫笉鍦?UI 鏆撮湶锛屼緵鑷姩鍖栬皟鐢?
@@ -271,12 +273,12 @@ window.__mcpImportDir = () => {
     el.dirPicker.click();
     return;
   }
-  setStatus('褰撳墠娴忚鍣ㄤ笉鏀寔 MCP 鏂囦欢澶瑰鍏?);
+  setStatus('Current browser does not support MCP folder import');
 };
 window.__mcpUseHiddenDir = () => {
   const files = el.mcpFiles?.files?.length ? el.mcpFiles.files : el.dirPicker?.files;
   state.files = Array.from(files || []);
-  setStatus(`宸查€氳繃 MCP 瀵煎叆鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
+  setStatus(`Imported via MCP: ${state.files.length} files`);
   if (state.files.length) {
     startScan();
   }
@@ -327,7 +329,7 @@ function renderGrid(options = {}) {
 
     const thumb = document.createElement('div');
     thumb.className = 'thumb';
-    thumb.textContent = '鍔犺浇涓?;
+    thumb.textContent = 'Loading...';
 
     let badge = null;
     if (item.isLive) {
@@ -338,7 +340,7 @@ function renderGrid(options = {}) {
 
     const check = document.createElement('div');
     check.className = 'check';
-    check.textContent = state.selection.has(item.id) ? '鉁? : '';
+    check.textContent = state.selection.has(item.id) ? '✓' : '';
 
     card.appendChild(thumb);
     if (badge) card.appendChild(badge);
@@ -392,7 +394,7 @@ function buildGroups(sorted) {
     const day = getDayKey(item, type);
     if (day !== current) {
       current = day;
-      groups.push({ type: 'group', label: `${day}锛?{counts.get(day) || 0}锛塦 });
+      groups.push({ type: 'group', label: `${day} (${counts.get(day) || 0})` });
     }
     groups.push({ type: 'item', item });
   }
@@ -518,9 +520,11 @@ function initViewer() {
       syncVideoToImage();
     },
     viewed() {
+      state.currentViewerIndex = Number.isFinite(state.viewer?.index) ? state.viewer.index : state.currentViewerIndex;
       closeLiveVideoInline();
       state.userAdjusted = false;
       hydrateViewerWindow(state.viewer.index, 6);
+      bindNativeViewerNavOverride();
       updateLiveButton();
       updateViewerTopbar();
       updateViewerPanel();
@@ -560,6 +564,10 @@ function releaseViewerUrls() {
     try { URL.revokeObjectURL(url); } catch {}
   }
   state.viewerUrlCache.clear();
+  const nodes = el.viewerGallery ? el.viewerGallery.querySelectorAll('img[data-id]') : [];
+  for (const node of nodes) {
+    node.setAttribute('src', VIEWER_PLACEHOLDER_SRC);
+  }
 }
 
 function hydrateViewerWindow(center, radius = 4) {
@@ -568,10 +576,14 @@ function hydrateViewerWindow(center, radius = 4) {
   const end = Math.min(list.length - 1, center + radius);
   for (let i = start; i <= end; i++) {
     const img = list[i];
-    if (!img || img.src) continue;
+    if (!img) continue;
     const id = img.dataset.id;
+    if (state.viewerUrlCache.has(id) && img.src && !img.src.startsWith('data:image/gif')) continue;
     const item = state.filtered.find((x) => x.id === id);
     if (!item) continue;
+    if (img.src && img.src.startsWith('blob:')) {
+      try { URL.revokeObjectURL(img.src); } catch {}
+    }
     const url = URL.createObjectURL(item.file);
     img.src = url;
     state.viewerUrlCache.set(id, url);
@@ -588,7 +600,7 @@ function hydrateViewerWindow(center, radius = 4) {
       URL.revokeObjectURL(url);
       state.viewerUrlCache.delete(id);
       const node = el.viewerGallery.querySelector(`img[data-id="${id}"]`);
-      if (node) node.removeAttribute('src');
+      if (node) node.setAttribute('src', VIEWER_PLACEHOLDER_SRC);
       if (state.viewerUrlCache.size <= limit) break;
     }
   }
@@ -601,6 +613,7 @@ function updateViewerGallery() {
     const img = document.createElement('img');
     img.dataset.id = item.id;
     img.dataset.live = item.isLive ? '1' : '0';
+    img.src = VIEWER_PLACEHOLDER_SRC;
     img.alt = item.name;
     el.viewerGallery.appendChild(img);
   }
@@ -611,13 +624,62 @@ function updateViewerGallery() {
 function openViewer(id) {
   const index = state.filtered.findIndex(i => i.id === id);
   if (index === -1) return;
+  state.currentViewerIndex = index;
   if (!el.viewerGallery.children.length || el.viewerGallery.children.length !== state.filtered.length) {
     updateViewerGallery();
   }
   hydrateViewerWindow(index, 6);
   initViewer();
+  if (state.viewer && typeof state.viewer.update === 'function') {
+    state.viewer.update();
+  }
   console.debug('[viewer] open', { id, index, total: state.filtered.length });
   state.viewer.view(index);
+}
+
+function viewAtIndex(targetIndex, reason = 'manual-nav') {
+  if (!state.viewer || !state.filtered.length) return;
+  const max = state.filtered.length - 1;
+  const index = Math.max(0, Math.min(max, targetIndex));
+  state.currentViewerIndex = index;
+  const node = el.viewerGallery.children[index];
+  if (node && !node.getAttribute('src')) {
+    const item = state.filtered[index];
+    if (item?.file) {
+      const old = state.viewerUrlCache.get(item.id);
+      if (old) {
+        try { URL.revokeObjectURL(old); } catch {}
+      }
+      const url = URL.createObjectURL(item.file);
+      node.setAttribute('src', url);
+      state.viewerUrlCache.set(item.id, url);
+      if (typeof state.viewer.update === 'function') state.viewer.update();
+    }
+  }
+  hydrateViewerWindow(index, 6);
+  state.viewer.view(index);
+  console.debug('[viewer-nav] viewAtIndex', { reason, index, max });
+}
+
+function bindNativeViewerNavOverride() {
+  const container = getViewerContainer();
+  if (!container || container.dataset.navOverrideBound === '1') return;
+  container.dataset.navOverrideBound = '1';
+  container.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn || !state.viewer) return;
+    const clz = btn.className || '';
+    const label = `${btn.getAttribute('title') || ''} ${btn.getAttribute('aria-label') || ''}`.toLowerCase();
+    const isPrev = clz.includes('viewer-prev') || /previous|上一|上一个/.test(label);
+    const isNext = clz.includes('viewer-next') || /next|下一|下一个/.test(label);
+    if (!isPrev && !isNext) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const cur = Number.isFinite(state.currentViewerIndex) && state.currentViewerIndex >= 0
+      ? state.currentViewerIndex
+      : (Number.isFinite(state.viewer.index) ? state.viewer.index : 0);
+    viewAtIndex(cur + (isNext ? 1 : -1), isNext ? 'native-next' : 'native-prev');
+  }, true);
 }
 
 function getViewerContainer() {
@@ -943,17 +1005,25 @@ function ensureViewerSideNav() {
   if (existing) return;
   const left = document.createElement('button');
   left.className = 'viewer-side-nav left';
-  left.title = '涓婁竴寮?;
+  left.title = 'Previous';
   const right = document.createElement('button');
   right.className = 'viewer-side-nav right';
-  right.title = '涓嬩竴寮?;
+  right.title = 'Next';
   left.addEventListener('click', () => {
     if (left.disabled) return;
-    if (state.viewer) state.viewer.prev(true);
+    if (!state.viewer) return;
+    const cur = Number.isFinite(state.currentViewerIndex) && state.currentViewerIndex >= 0
+      ? state.currentViewerIndex
+      : (Number.isFinite(state.viewer.index) ? state.viewer.index : 0);
+    viewAtIndex(cur - 1, 'side-prev');
   });
   right.addEventListener('click', () => {
     if (right.disabled) return;
-    if (state.viewer) state.viewer.next(true);
+    if (!state.viewer) return;
+    const cur = Number.isFinite(state.currentViewerIndex) && state.currentViewerIndex >= 0
+      ? state.currentViewerIndex
+      : (Number.isFinite(state.viewer.index) ? state.viewer.index : 0);
+    viewAtIndex(cur + 1, 'side-next');
   });
   container.appendChild(left);
   container.appendChild(right);
@@ -964,7 +1034,9 @@ function updateNavDisabled() {
   if (!container || !state.viewer) return;
   const left = container.querySelector('.viewer-side-nav.left');
   const right = container.querySelector('.viewer-side-nav.right');
-  const idx = state.viewer.index ?? 0;
+  const idx = Number.isFinite(state.currentViewerIndex) && state.currentViewerIndex >= 0
+    ? state.currentViewerIndex
+    : (state.viewer.index ?? 0);
   const max = (state.filtered?.length || 1) - 1;
   if (left) left.disabled = idx <= 0;
   if (right) right.disabled = idx >= max;
@@ -1199,13 +1271,13 @@ function syncLiveButtonState() {
 function buildDetailRows(item) {
   const exif = item.exif || {};
   return [
-    ['绫诲瀷', item.isLive ? 'Live Photo' : '闈欐€佸浘鐗?],
-    ['鍘傚晢', item.isLive ? item.liveType : '-'],
-    ['鎷嶆憚鏃堕棿', exif.DateTimeOriginal || exif.DateTime || '-'],
-    ['鏈哄瀷', exif.Model || '-'],
-    ['鍘傚晢鍚?, exif.Make || '-'],
-    ['闀滃ご', exif.LensModel || '-'],
-    ['灏哄', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} 脳 ${exif.ImageHeight}` : '-'],
+    ['Type', item.isLive ? 'Live Photo' : 'Still Image'],
+    ['Vendor', item.isLive ? item.liveType : '-'],
+    ['Capture Time', exif.DateTimeOriginal || exif.DateTime || '-'],
+    ['Model', exif.Model || '-'],
+    ['Make', exif.Make || '-'],
+    ['Lens', exif.LensModel || '-'],
+    ['Size', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
   ];
 }
 
@@ -1278,7 +1350,7 @@ async function scanFiles(files) {
 
 async function analyzeFile(file, byBase) {
   const id = crypto.randomUUID();
-  const item = { id, name: file.name, file, isLive: false, liveType: '闈欐€?, videoBlob: null, thumbLoaded: false, exif: null, exifTime: null, exifChecked: false, objectUrl: null };
+  const item = { id, name: file.name, file, isLive: false, liveType: 'Still', videoBlob: null, thumbLoaded: false, exif: null, exifTime: null, exifChecked: false, objectUrl: null };
   const base = file.name.replace(/\.[^/.]+$/, '').toLowerCase();
   const siblings = byBase.get(base) || [];
 
@@ -1315,7 +1387,7 @@ async function analyzeFile(file, byBase) {
     const videoBlob = extractEmbeddedVideo(buf);
     if (videoBlob) {
       item.isLive = true;
-      item.liveType = item.liveType === '闈欐€? ? '鍐呭祵瑙嗛' : item.liveType;
+      item.liveType = item.liveType === 'Still' ? 'Embedded Video' : item.liveType;
       item.videoBlob = videoBlob;
     }
   } catch {
@@ -1478,15 +1550,15 @@ function buildDetailRows(item) {
   const exif = item.exif || {};
   const gps = formatGps(exif);
   return [
-    ['鏂囦欢鍚?, item.name || '-'],
-    ['绫诲瀷', item.isLive ? 'Live Photo' : '闈欐€佸浘鐗?],
-    ['鍘傚晢', item.isLive ? item.liveType : '-'],
-    ['鎷嶆憚鏃堕棿', exif.DateTimeOriginal || exif.DateTime || '-'],
-    ['鏈哄瀷', exif.Model || '-'],
-    ['鍘傚晢鍚?, exif.Make || '-'],
-    ['闀滃ご', exif.LensModel || '-'],
-    ['灏哄', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
-    ['瀹氫綅', gps || '-'],
+    ['File Name', item.name || '-'],
+    ['Type', item.isLive ? 'Live Photo' : 'Still Image'],
+    ['Vendor', item.isLive ? item.liveType : '-'],
+    ['Capture Time', exif.DateTimeOriginal || exif.DateTime || '-'],
+    ['Model', exif.Model || '-'],
+    ['Make', exif.Make || '-'],
+    ['Lens', exif.LensModel || '-'],
+    ['Size', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
+    ['Location', gps || '-'],
   ];
 }
 
@@ -1524,6 +1596,36 @@ function extractEmbeddedVideo(buf, xmpOffset = null) {
     if (video[4] === 0x66 && video[5] === 0x74 && video[6] === 0x79 && video[7] === 0x70) {
       return new Blob([video], { type: 'video/mp4' });
     }
+  }
+  return null;
+}
+
+function findMp4FtypOffset(buf) {
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length - 12; i++) {
+    if (bytes[i + 4] === 0x66 && bytes[i + 5] === 0x74 && bytes[i + 6] === 0x79 && bytes[i + 7] === 0x70) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
+  const minBytes = 200 * 1024;
+  const probeSizes = [1024 * 1024, 4 * 1024 * 1024];
+  for (const size of probeSizes) {
+    const probe = await readHeadBytes(file, Math.min(size, file.size));
+    let offset = Number.isFinite(preferredOffset) && preferredOffset > 0 ? preferredOffset : findMp4FtypOffset(probe);
+    if (offset < 0) continue;
+    if (offset + 12 > probe.byteLength) {
+      const bigger = await readHeadBytes(file, Math.min(file.size, Math.max(size * 2, offset + 32)));
+      offset = findMp4FtypOffset(bigger);
+      if (offset < 0) continue;
+    }
+    if (file.size - offset < minBytes) continue;
+    const tail = await file.slice(offset).arrayBuffer();
+    const blob = extractEmbeddedVideo(tail, 0);
+    if (blob) return blob;
   }
   return null;
 }
@@ -1608,15 +1710,24 @@ function analyzeFile(file, byBase) {
         if (/OPPO|oppo/i.test(xmp)) vendorType = 'OPPO Live Photo';
         if (/HONOR|honor/i.test(xmp)) vendorType = 'HONOR Live Photo';
       }
+      const makeText = String(exif?.Make || '').toLowerCase();
+      const modelText = String(exif?.Model || '').toLowerCase();
+      if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) vendorType = 'HONOR Live Photo';
 
-      if (shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset)) {
+      let videoBlob = null;
+      const needsDeepScan = shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
+      if (!needsDeepScan) {
+        // Honor and similar vendors may store MP4 in the middle without MotionPhoto XMP tags.
+        videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
+      }
+      if (!videoBlob && needsDeepScan) {
         const full = await file.arrayBuffer();
-        const videoBlob = extractEmbeddedVideo(full, microOffset);
-        if (videoBlob) {
-          item.isLive = true;
-          item.liveType = vendorType || (hasMotionTag ? 'Google Motion Photo' : 'Embedded Video');
-          item.videoBlob = videoBlob;
-        }
+        videoBlob = extractEmbeddedVideo(full, microOffset);
+      }
+      if (videoBlob) {
+        item.isLive = true;
+        item.liveType = vendorType || (hasMotionTag ? 'Google Motion Photo' : 'Embedded Video');
+        item.videoBlob = videoBlob;
       }
     } catch {
       // ignore
@@ -1852,7 +1963,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 
         const check = document.createElement('div');
         check.className = 'check';
-        check.textContent = state.selection.has(item.id) ? '鉁? : '';
+        check.textContent = state.selection.has(item.id) ? '✓' : '';
 
         card.appendChild(thumb);
         card.appendChild(check);
