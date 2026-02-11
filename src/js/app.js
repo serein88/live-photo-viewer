@@ -1,4 +1,4 @@
-const state = {
+﻿const state = {
   files: [],
   items: [],
   filtered: [],
@@ -12,6 +12,7 @@ const state = {
   sortKey: 'mtime_desc',
   exifQueueRunning: false,
   userAdjusted: false,
+  viewerUrlCache: new Map(),
 };
 const EXIF_SLICE_SIZE = 256 * 1024;
 let renderTimer = null;
@@ -72,7 +73,7 @@ const supportsWebkitDir = 'webkitdirectory' in el.dirPicker;
 const supportsFolder = supportsDirectoryPicker || supportsWebkitDir;
 if (!supportsFolder && !platformInfo.isIOS) {
   el.folderBtn.disabled = true;
-  el.folderBtn.title = '此浏览器不支持文件夹选择，请使用多选文件。';
+  el.folderBtn.title = 'This browser does not support folder selection. Please use multi-file selection.';
 }
 
 function applyLayout(mode) {
@@ -95,7 +96,7 @@ function updateStats() {
   const total = state.items.length;
   const live = state.items.filter(i => i.isLive).length;
   const selected = state.selection.size;
-  el.stats.textContent = `总计 ${total} · Live ${live} · 已选 ${selected}`;
+  el.stats.textContent = `鎬昏 ${total} 路 Live ${live} 路 宸查€?${selected}`;
   el.exportBtn.disabled = selected === 0;
 }
 
@@ -109,7 +110,7 @@ function setFilter(f) {
 async function handleSelectedFiles(files, source) {
   if (!files || !files.length) return;
   if (files.length >= 1 && files.every(isBundleFile)) {
-    setStatus('检测到 MCP bundle，加载中...');
+    setStatus('妫€娴嬪埌 MCP bundle锛屽姞杞戒腑...');
     let loadedAll = [];
     for (const f of files) {
       const loaded = await loadBundle(f);
@@ -117,20 +118,20 @@ async function handleSelectedFiles(files, source) {
     }
     if (loadedAll.length) {
       state.files = loadedAll;
-      setStatus(`已通过 MCP bundle 导入，共 ${state.files.length} 个文件`);
+      setStatus(`宸查€氳繃 MCP bundle 瀵煎叆锛屽叡 ${state.files.length} 涓枃浠禶);
       startScan();
     } else {
-      setStatus('MCP bundle 加载失败');
+      setStatus('MCP bundle 鍔犺浇澶辫触');
     }
     return;
   }
   state.files = files;
   if (source === 'dir') {
-    setStatus(`已选择文件夹，共 ${state.files.length} 个文件`);
+    setStatus(`宸查€夋嫨鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
   } else if (source === 'mcp') {
-    setStatus(`已通过 MCP 导入文件夹，共 ${state.files.length} 个文件`);
+    setStatus(`宸查€氳繃 MCP 瀵煎叆鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
   } else {
-    setStatus(`已选择 ${state.files.length} 个文件，自动扫描中...`);
+    setStatus(`宸查€夋嫨 ${state.files.length} 涓枃浠讹紝鑷姩鎵弿涓?..`);
   }
   startScan();
 }
@@ -163,7 +164,7 @@ async function loadBundle(file) {
 async function startScan() {
   if (!state.files.length || state.scanning) return;
   state.scanning = true;
-  setStatus('扫描中...');
+  setStatus('鎵弿涓?..');
   if (state.items.length) {
     state.items.forEach((item) => {
       if (item.objectUrl) {
@@ -180,7 +181,7 @@ async function startScan() {
   renderGrid();
   updateStats();
   state.scanning = false;
-  setStatus('扫描完成');
+  setStatus('鎵弿瀹屾垚');
 }
 
 document.getElementById('filterAll').onclick = () => setFilter('all');
@@ -210,9 +211,15 @@ async function pickDirectoryByPlatform() {
   const env = platformInfo;
   console.debug('[dir-pick] platform', env);
   if (env.isIOS) {
-    setStatus('iOS 不支持目录选择，已切换为多文件选择');
+    setStatus('iOS 涓嶆敮鎸佺洰褰曢€夋嫨锛屽凡鍒囨崲涓哄鏂囦欢閫夋嫨');
     openFilePickerFallback();
     return [];
+  }
+  // On Android, prefer webkitdirectory to avoid a second picker flow.
+  if (env.isAndroid && supportsWebkitDir) {
+    const files = await pickDirectoryWithInput();
+    console.debug('[dir-pick] android webkitdirectory files', files.length);
+    return files;
   }
   if (supportsDirectoryPicker) {
     try {
@@ -223,6 +230,7 @@ async function pickDirectoryByPlatform() {
     } catch (err) {
       console.debug('[dir-pick] showDirectoryPicker cancel/error', err);
       if (err && err.name === 'AbortError') return [];
+      return [];
     }
   }
   if (supportsWebkitDir) {
@@ -233,13 +241,12 @@ async function pickDirectoryByPlatform() {
   console.debug('[dir-pick] no directory support');
   return [];
 }
-
 el.folderBtn.addEventListener('click', async () => {
   const files = await pickDirectoryByPlatform();
   if (files.length) {
     handleSelectedFiles(files, 'dir');
   } else if (!platformInfo.isIOS) {
-    setStatus('已取消文件夹选择');
+    setStatus('宸插彇娑堟枃浠跺す閫夋嫨');
   }
 });
 
@@ -247,14 +254,14 @@ el.folderBtn.addEventListener('click', async () => {
 el.exportBtn.addEventListener('click', async () => {
   const selected = state.items.filter(i => state.selection.has(i.id) && i.isLive);
   if (!selected.length) return;
-  setStatus(`导出 ${selected.length} 个项目中...`);
+  setStatus(`瀵煎嚭 ${selected.length} 涓」鐩腑...`);
   for (const item of selected) {
     await exportItem(item);
   }
-  setStatus('导出完成（若浏览器阻止下载，请允许多文件下载）');
+  setStatus('瀵煎嚭瀹屾垚锛堣嫢娴忚鍣ㄩ樆姝笅杞斤紝璇峰厑璁稿鏂囦欢涓嬭浇锛?);
 });
 
-// MCP 调试入口：不在 UI 暴露，供自动化调用
+// MCP 璋冭瘯鍏ュ彛锛氫笉鍦?UI 鏆撮湶锛屼緵鑷姩鍖栬皟鐢?
 window.__mcpImportDir = () => {
   if (el.mcpFiles) {
     el.mcpFiles.click();
@@ -264,12 +271,12 @@ window.__mcpImportDir = () => {
     el.dirPicker.click();
     return;
   }
-  setStatus('当前浏览器不支持 MCP 文件夹导入');
+  setStatus('褰撳墠娴忚鍣ㄤ笉鏀寔 MCP 鏂囦欢澶瑰鍏?);
 };
 window.__mcpUseHiddenDir = () => {
   const files = el.mcpFiles?.files?.length ? el.mcpFiles.files : el.dirPicker?.files;
   state.files = Array.from(files || []);
-  setStatus(`已通过 MCP 导入文件夹，共 ${state.files.length} 个文件`);
+  setStatus(`宸查€氳繃 MCP 瀵煎叆鏂囦欢澶癸紝鍏?${state.files.length} 涓枃浠禶);
   if (state.files.length) {
     startScan();
   }
@@ -320,7 +327,7 @@ function renderGrid(options = {}) {
 
     const thumb = document.createElement('div');
     thumb.className = 'thumb';
-    thumb.textContent = '加载中';
+    thumb.textContent = '鍔犺浇涓?;
 
     let badge = null;
     if (item.isLive) {
@@ -331,7 +338,7 @@ function renderGrid(options = {}) {
 
     const check = document.createElement('div');
     check.className = 'check';
-    check.textContent = state.selection.has(item.id) ? '✓' : '';
+    check.textContent = state.selection.has(item.id) ? '鉁? : '';
 
     card.appendChild(thumb);
     if (badge) card.appendChild(badge);
@@ -385,7 +392,7 @@ function buildGroups(sorted) {
     const day = getDayKey(item, type);
     if (day !== current) {
       current = day;
-      groups.push({ type: 'group', label: `${day}（${counts.get(day) || 0}）` });
+      groups.push({ type: 'group', label: `${day}锛?{counts.get(day) || 0}锛塦 });
     }
     groups.push({ type: 'item', item });
   }
@@ -399,7 +406,7 @@ function getDayKey(item, type) {
   } else {
     ts = item.file?.lastModified ?? 0;
   }
-  if (!ts) return '未知日期';
+  if (!ts) return '鏈煡鏃ユ湡';
   const d = new Date(ts);
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -513,6 +520,7 @@ function initViewer() {
     viewed() {
       closeLiveVideoInline();
       state.userAdjusted = false;
+      hydrateViewerWindow(state.viewer.index, 6);
       updateLiveButton();
       updateViewerTopbar();
       updateViewerPanel();
@@ -533,6 +541,7 @@ function initViewer() {
       removeViewerTopbar();
       removeViewerPanel();
       closeLiveVideoInline();
+      releaseViewerUrls();
       const container = getViewerContainer();
       if (container) {
         container.classList.remove('nav-active', 'nav-idle', 'panel-open');
@@ -542,14 +551,56 @@ function initViewer() {
   });
 }
 
+function getViewerUrlLimit() {
+  return platformInfo.isAndroid ? 24 : 64;
+}
+
+function releaseViewerUrls() {
+  for (const url of state.viewerUrlCache.values()) {
+    try { URL.revokeObjectURL(url); } catch {}
+  }
+  state.viewerUrlCache.clear();
+}
+
+function hydrateViewerWindow(center, radius = 4) {
+  const list = el.viewerGallery.children;
+  const start = Math.max(0, center - radius);
+  const end = Math.min(list.length - 1, center + radius);
+  for (let i = start; i <= end; i++) {
+    const img = list[i];
+    if (!img || img.src) continue;
+    const id = img.dataset.id;
+    const item = state.filtered.find((x) => x.id === id);
+    if (!item) continue;
+    const url = URL.createObjectURL(item.file);
+    img.src = url;
+    state.viewerUrlCache.set(id, url);
+  }
+  const limit = getViewerUrlLimit();
+  if (state.viewerUrlCache.size > limit) {
+    const keep = new Set();
+    for (let i = start; i <= end; i++) {
+      const img = list[i];
+      if (img?.dataset?.id) keep.add(img.dataset.id);
+    }
+    for (const [id, url] of state.viewerUrlCache) {
+      if (keep.has(id)) continue;
+      URL.revokeObjectURL(url);
+      state.viewerUrlCache.delete(id);
+      const node = el.viewerGallery.querySelector(`img[data-id="${id}"]`);
+      if (node) node.removeAttribute('src');
+      if (state.viewerUrlCache.size <= limit) break;
+    }
+  }
+}
+
 function updateViewerGallery() {
+  releaseViewerUrls();
   el.viewerGallery.innerHTML = '';
   for (const item of state.filtered) {
     const img = document.createElement('img');
     img.dataset.id = item.id;
     img.dataset.live = item.isLive ? '1' : '0';
-    if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
-    img.src = item.objectUrl;
     img.alt = item.name;
     el.viewerGallery.appendChild(img);
   }
@@ -560,6 +611,10 @@ function updateViewerGallery() {
 function openViewer(id) {
   const index = state.filtered.findIndex(i => i.id === id);
   if (index === -1) return;
+  if (!el.viewerGallery.children.length || el.viewerGallery.children.length !== state.filtered.length) {
+    updateViewerGallery();
+  }
+  hydrateViewerWindow(index, 6);
   initViewer();
   console.debug('[viewer] open', { id, index, total: state.filtered.length });
   state.viewer.view(index);
@@ -603,12 +658,12 @@ function ensureViewerTopbar() {
     bar.className = 'viewer-topbar';
     bar.innerHTML = `
       <div class="topbar-left">
-        <button class="topbar-btn back" title="返回" aria-label="返回"></button>
-        <div class="topbar-title">预览</div>
+        <button class="topbar-btn back" title="杩斿洖" aria-label="杩斿洖"></button>
+        <div class="topbar-title">棰勮</div>
       </div>
       <div class="topbar-right">
         <div class="topbar-live-slot"></div>
-        <button class="topbar-btn info" title="信息" aria-label="信息"></button>
+        <button class="topbar-btn info" title="淇℃伅" aria-label="淇℃伅"></button>
       </div>
     `;
     container.appendChild(bar);
@@ -635,7 +690,7 @@ function updateViewerTopbar() {
   if (!bar) return;
   const title = bar.querySelector('.topbar-title');
   const current = state.filtered[viewer.index];
-  title.textContent = current ? current.name : '预览';
+  title.textContent = current ? current.name : '棰勮';
   const panel = document.querySelector('.viewer-panel');
   syncPanelState(!!(panel && !panel.classList.contains('hidden')));
   const container = getViewerContainer();
@@ -658,11 +713,11 @@ function ensureViewerPanel() {
     panel.className = 'viewer-panel hidden';
     panel.innerHTML = `
       <div class="panel-header">
-        <span>信息</span>
-        <button class="topbar-btn close" title="关闭" aria-label="关闭"></button>
+        <span>淇℃伅</span>
+        <button class="topbar-btn close" title="鍏抽棴" aria-label="鍏抽棴"></button>
       </div>
       <div class="panel-body">
-        <div class="panel-hint">添加说明</div>
+        <div class="panel-hint">娣诲姞璇存槑</div>
         <div class="panel-grid"></div>
       </div>
     `;
@@ -888,10 +943,10 @@ function ensureViewerSideNav() {
   if (existing) return;
   const left = document.createElement('button');
   left.className = 'viewer-side-nav left';
-  left.title = '上一张';
+  left.title = '涓婁竴寮?;
   const right = document.createElement('button');
   right.className = 'viewer-side-nav right';
-  right.title = '下一张';
+  right.title = '涓嬩竴寮?;
   left.addEventListener('click', () => {
     if (left.disabled) return;
     if (state.viewer) state.viewer.prev(true);
@@ -945,7 +1000,7 @@ function updateLiveButton() {
   if (!btn) {
     btn = document.createElement('button');
     btn.className = 'viewer-live-btn';
-    btn.title = '播放 Live';
+    btn.title = '鎾斁 Live';
     btn.addEventListener('click', () => {
       const item = state.filtered[viewer.index];
       if (!item || !item.videoBlob) return;
@@ -972,7 +1027,7 @@ function updateLiveButton() {
   if (!muteBtn) {
     muteBtn = document.createElement('button');
     muteBtn.className = 'viewer-mute-btn';
-    muteBtn.title = '静音/取消静音';
+    muteBtn.title = '闈欓煶/鍙栨秷闈欓煶';
     muteBtn.dataset.muted = String(state.liveMuted);
     muteBtn.addEventListener('click', () => {
       state.liveMuted = !state.liveMuted;
@@ -1138,19 +1193,19 @@ function syncLiveButtonState() {
   const { layer, video } = getLiveVideoRefs();
   const playing = !!(layer && layer.classList.contains('active') && video && !video.paused && !video.ended);
   btn.dataset.state = playing ? 'pause' : 'play';
-  btn.title = playing ? '暂停 Live' : '播放 Live';
+  btn.title = playing ? '鏆傚仠 Live' : '鎾斁 Live';
 }
 
 function buildDetailRows(item) {
   const exif = item.exif || {};
   return [
-    ['类型', item.isLive ? 'Live Photo' : '静态图片'],
-    ['厂商', item.isLive ? item.liveType : '-'],
-    ['拍摄时间', exif.DateTimeOriginal || exif.DateTime || '-'],
-    ['机型', exif.Model || '-'],
-    ['厂商名', exif.Make || '-'],
-    ['镜头', exif.LensModel || '-'],
-    ['尺寸', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} × ${exif.ImageHeight}` : '-'],
+    ['绫诲瀷', item.isLive ? 'Live Photo' : '闈欐€佸浘鐗?],
+    ['鍘傚晢', item.isLive ? item.liveType : '-'],
+    ['鎷嶆憚鏃堕棿', exif.DateTimeOriginal || exif.DateTime || '-'],
+    ['鏈哄瀷', exif.Model || '-'],
+    ['鍘傚晢鍚?, exif.Make || '-'],
+    ['闀滃ご', exif.LensModel || '-'],
+    ['灏哄', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} 脳 ${exif.ImageHeight}` : '-'],
   ];
 }
 
@@ -1223,7 +1278,7 @@ async function scanFiles(files) {
 
 async function analyzeFile(file, byBase) {
   const id = crypto.randomUUID();
-  const item = { id, name: file.name, file, isLive: false, liveType: '静态', videoBlob: null, thumbLoaded: false, exif: null, exifTime: null, exifChecked: false, objectUrl: null };
+  const item = { id, name: file.name, file, isLive: false, liveType: '闈欐€?, videoBlob: null, thumbLoaded: false, exif: null, exifTime: null, exifChecked: false, objectUrl: null };
   const base = file.name.replace(/\.[^/.]+$/, '').toLowerCase();
   const siblings = byBase.get(base) || [];
 
@@ -1260,7 +1315,7 @@ async function analyzeFile(file, byBase) {
     const videoBlob = extractEmbeddedVideo(buf);
     if (videoBlob) {
       item.isLive = true;
-      item.liveType = item.liveType === '静态' ? '内嵌视频' : item.liveType;
+      item.liveType = item.liveType === '闈欐€? ? '鍐呭祵瑙嗛' : item.liveType;
       item.videoBlob = videoBlob;
     }
   } catch {
@@ -1423,15 +1478,15 @@ function buildDetailRows(item) {
   const exif = item.exif || {};
   const gps = formatGps(exif);
   return [
-    ['文件名', item.name || '-'],
-    ['类型', item.isLive ? 'Live Photo' : '静态图片'],
-    ['厂商', item.isLive ? item.liveType : '-'],
-    ['拍摄时间', exif.DateTimeOriginal || exif.DateTime || '-'],
-    ['机型', exif.Model || '-'],
-    ['厂商名', exif.Make || '-'],
-    ['镜头', exif.LensModel || '-'],
-    ['尺寸', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
-    ['定位', gps || '-'],
+    ['鏂囦欢鍚?, item.name || '-'],
+    ['绫诲瀷', item.isLive ? 'Live Photo' : '闈欐€佸浘鐗?],
+    ['鍘傚晢', item.isLive ? item.liveType : '-'],
+    ['鎷嶆憚鏃堕棿', exif.DateTimeOriginal || exif.DateTime || '-'],
+    ['鏈哄瀷', exif.Model || '-'],
+    ['鍘傚晢鍚?, exif.Make || '-'],
+    ['闀滃ご', exif.LensModel || '-'],
+    ['灏哄', exif.ImageWidth && exif.ImageHeight ? `${exif.ImageWidth} x ${exif.ImageHeight}` : '-'],
+    ['瀹氫綅', gps || '-'],
   ];
 }
 
@@ -1478,6 +1533,21 @@ async function readHeadBytes(file, size) {
   return slice.arrayBuffer();
 }
 
+function getScanConcurrency() {
+  if (platformInfo.isAndroid) return 2;
+  if (platformInfo.isIOS) return 2;
+  return 6;
+}
+
+function shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset) {
+  if (hasMotionTag || microOffset != null) return true;
+  const lower = (file.name || '').toLowerCase();
+  const nameHint = /(live|motion|mvimg|microvideo)/i.test(lower);
+  if (nameHint && file.size <= 40 * 1024 * 1024) return true;
+  if (xmp && /GCamera|MotionPhoto|MicroVideo|Xiaomi|vivo|OPPO|HONOR/i.test(xmp)) return true;
+  return false;
+}
+
 async function scanFiles(files) {
   const items = [];
   const byBase = new Map();
@@ -1517,7 +1587,8 @@ function analyzeFile(file, byBase) {
     }
 
     try {
-      const head = await readHeadBytes(file, 1024 * 1024);
+      const headReadSize = platformInfo.isAndroid ? 256 * 1024 : 512 * 1024;
+      const head = await readHeadBytes(file, headReadSize);
       const xmp = extractXmp(head);
       const exif = extractExif(head);
       item.exifChecked = true;
@@ -1538,7 +1609,7 @@ function analyzeFile(file, byBase) {
         if (/HONOR|honor/i.test(xmp)) vendorType = 'HONOR Live Photo';
       }
 
-      if (hasMotionTag || microOffset != null || file.size < 12 * 1024 * 1024) {
+      if (shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset)) {
         const full = await file.arrayBuffer();
         const videoBlob = extractEmbeddedVideo(full, microOffset);
         if (videoBlob) {
@@ -1635,17 +1706,20 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 
     const queue = files.filter(f => f.type.startsWith('image/'));
     const total = queue.length;
-    const concurrency = 6;
+    const concurrency = getScanConcurrency();
+    const yieldEvery = platformInfo.isAndroid ? 8 : 24;
     let done = 0;
 
     updateScanOverlay(0, total, 'Scanning');
+    setStatus(`Scanning ${done}/${total}...`);
     for (let start = 0; start < queue.length; start += concurrency) {
       const chunk = queue.slice(start, start + concurrency);
       const chunkItems = await Promise.all(chunk.map(file => analyzeFile(file, byBase)));
       items.push(...chunkItems);
       done += chunk.length;
       updateScanOverlay(done, total, 'Scanning');
-      if (done % 24 === 0) {
+      setStatus(`Scanning ${done}/${total}...`);
+      if (done % yieldEvery === 0) {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
@@ -1687,8 +1761,10 @@ function readTagValue(view, type, count, valueOffset, little, base) {
       const img = document.createElement('img');
       img.loading = 'lazy';
       img.decoding = 'async';
-      if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
-      img.src = item.objectUrl;
+      const tmpUrl = URL.createObjectURL(item.file);
+      img.src = tmpUrl;
+      img.onload = () => URL.revokeObjectURL(tmpUrl);
+      img.onerror = () => URL.revokeObjectURL(tmpUrl);
       holder.textContent = '';
       holder.appendChild(img);
       item.thumbLoaded = true;
@@ -1715,7 +1791,16 @@ function readTagValue(view, type, count, valueOffset, little, base) {
       live: sorted.filter(i => i.isLive).length,
       filter: state.filter
     });
-    if (!skipGallery) updateViewerGallery();
+    if (!skipGallery) {
+      const galleryLimit = platformInfo.isAndroid ? 400 : 1200;
+      if (sorted.length <= galleryLimit) {
+        updateViewerGallery();
+      } else {
+        releaseViewerUrls();
+        el.viewerGallery.innerHTML = '';
+        console.debug('[viewer] defer gallery build for large list', { total: sorted.length, galleryLimit });
+      }
+    }
 
     const map = state.itemById && state.itemById.size ? state.itemById : new Map(state.items.map(i => [i.id, i]));
     state.itemById = map;
@@ -1732,7 +1817,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 
     const groups = buildGroups(sorted);
     let index = 0;
-    const chunkSize = 180;
+    const chunkSize = platformInfo.isAndroid ? 72 : 180;
 
     const renderChunk = () => {
       const frag = document.createDocumentFragment();
@@ -1767,7 +1852,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 
         const check = document.createElement('div');
         check.className = 'check';
-        check.textContent = state.selection.has(item.id) ? '✓' : '';
+        check.textContent = state.selection.has(item.id) ? '鉁? : '';
 
         card.appendChild(thumb);
         card.appendChild(check);
@@ -1788,3 +1873,4 @@ function readTagValue(view, type, count, valueOffset, little, base) {
   renderGrid = renderGridOverride;
   loadThumbnail = loadThumbnailOverride;
 })();
+
