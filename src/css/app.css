@@ -250,6 +250,7 @@ main { padding: 16px 20px 40px; }
   position: absolute;
   top: 8px;
   left: 8px;
+  z-index: 3;
   width: 26px;
   height: 26px;
   border-radius: 999px;

@@ -1004,17 +1004,55 @@ function openLiveVideoInline(item) {
   if (!layer) return;
   const video = layer.querySelector('video');
   if (!video) return;
-  if (state.viewer && state.viewer.image) {
-    state.viewer.image.style.opacity = '0';
-  }
-  video.src = URL.createObjectURL(item.videoBlob);
+  const previewImage = state.viewer?.image || null;
+  const videoUrl = URL.createObjectURL(item.videoBlob);
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.controls = false;
+  video.src = videoUrl;
   video.currentTime = 0;
   video.muted = state.liveMuted;
+  console.debug('[live-debug] open', {
+    name: item.name,
+    blobType: item.videoBlob?.type || '(empty)',
+    blobSize: item.videoBlob?.size || 0,
+    muted: video.muted,
+    isAndroid: !!platformInfo?.isAndroid,
+    canPlayMp4: video.canPlayType('video/mp4'),
+    canPlayQuickTime: video.canPlayType('video/quicktime')
+  });
   video.onloadedmetadata = () => {
+    console.debug('[live-debug] loadedmetadata', {
+      name: item.name,
+      width: video.videoWidth,
+      height: video.videoHeight,
+      duration: video.duration
+    });
     if (!state.userAdjusted) {
       fitImageToCanvas();
     }
     syncVideoToImage();
+  };
+  video.oncanplay = () => {
+    console.debug('[live-debug] canplay', { name: item.name });
+  };
+  video.onwaiting = () => {
+    console.debug('[live-debug] waiting', { name: item.name, t: video.currentTime });
+  };
+  video.onstalled = () => {
+    console.debug('[live-debug] stalled', { name: item.name, t: video.currentTime });
+  };
+  video.onerror = () => {
+    const mediaError = video.error;
+    console.debug('[live-debug] video error', {
+      name: item.name,
+      code: mediaError?.code || null,
+      message: mediaError?.message || '(no-message)'
+    });
+    if (previewImage) {
+      previewImage.style.opacity = '';
+    }
+    closeLiveVideoInline();
   };
   layer.classList.add('active');
   if (state.viewer && state.viewer.viewed) {
@@ -1026,15 +1064,39 @@ function openLiveVideoInline(item) {
     closeLiveVideoInline();
   };
   video.onplay = () => {
+    if (previewImage) {
+      previewImage.style.opacity = '0';
+    }
     state.livePlaying = true;
     syncLiveButtonState();
+    console.debug('[live-debug] onplay', { name: item.name, t: video.currentTime });
   };
   video.onpause = () => {
     state.livePlaying = false;
     syncLiveButtonState();
+    console.debug('[live-debug] onpause', { name: item.name, t: video.currentTime });
   };
   console.debug('[viewer] live play', { name: item.name });
-  video.play().catch(() => {});
+  video.play().catch((err) => {
+    console.debug('[live-debug] play reject', {
+      name: item.name,
+      message: err?.message || String(err),
+      isAndroid: !!platformInfo?.isAndroid
+    });
+    if (platformInfo?.isAndroid) {
+      video.muted = true;
+      state.liveMuted = true;
+      const muteBtn = document.querySelector('.viewer-mute-btn');
+      if (muteBtn) muteBtn.dataset.muted = 'true';
+      video.controls = true;
+      video.play().catch((retryErr) => {
+        console.debug('[live-debug] retry reject', {
+          name: item.name,
+          message: retryErr?.message || String(retryErr)
+        });
+      });
+    }
+  });
 }
 
 function closeLiveVideoInline() {
@@ -1047,6 +1109,11 @@ function closeLiveVideoInline() {
     video.onended = null;
     video.onplay = null;
     video.onpause = null;
+    video.oncanplay = null;
+    video.onwaiting = null;
+    video.onstalled = null;
+    video.onerror = null;
+    video.controls = false;
     if (video.src) URL.revokeObjectURL(video.src);
     video.removeAttribute('src');
   }
@@ -1643,6 +1710,11 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     const list = state.items.filter(i => state.filter === 'all' || (state.filter === 'live' ? i.isLive : !i.isLive));
     const sorted = applySort(list);
     state.filtered = sorted;
+    console.debug('[grid] render', {
+      total: sorted.length,
+      live: sorted.filter(i => i.isLive).length,
+      filter: state.filter
+    });
     if (!skipGallery) updateViewerGallery();
 
     const map = state.itemById && state.itemById.size ? state.itemById : new Map(state.items.map(i => [i.id, i]));

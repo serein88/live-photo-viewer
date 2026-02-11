@@ -123,4 +123,28 @@
 - 文档更新：重写 `开发文档.md`，明确模块化架构、目录职责、协作流程、后续拆分计划。
 - 项目管理补齐：新增 `README.md`、`docs/ROADMAP.md`、`docs/CHANGELOG.md`，用于规划、变更记录和团队交接。
 
+## 本次对话摘要（2026-02-11）
+- 安卓 Live 黑屏排查增强（`src/js/app.js`）：
+  - 在 `openLiveVideoInline()` 增加调试日志：`[live-debug] open/loadedmetadata/canplay/waiting/stalled/video error/play reject/retry reject/onplay/onpause`。
+  - 播放策略调整：不再在播放开始前立即隐藏图片层，改为 `onplay` 时再隐藏，避免视频未起播导致黑屏。
+  - 安卓回退：首次 `video.play()` 失败时，自动切到 `muted=true + controls=true` 并重试，便于触摸端手动接管播放。
+  - 清理补全：`closeLiveVideoInline()` 增加 `oncanplay/onwaiting/onstalled/onerror` 解绑并恢复 `controls=false`。
+- 缩略图 Live 标识恢复（`src/css/app.css`）：
+  - 为 `.live-icon` 增加 `z-index: 3`，保证左上角 Live 图标不被缩略图内容遮挡。
+- 网格调试信息（`src/js/app.js`）：
+  - `renderGrid` 增加 `[grid] render` 日志，输出当前筛选结果总数与 live 数，便于区分“识别失败”与“展示层被遮挡”。
+
+## Android Live 黑屏调试步骤（接手即用）
+1. Android 设备连接 PC，使用 Chrome `chrome://inspect` 远程调试页面。
+2. 打开一张 Live 图，过滤控制台关键字：`live-debug`。
+3. 重点查看：
+   - `blobType/blobSize`（是否抽出视频）
+   - `canPlayMp4/canPlayQuickTime`（浏览器是否声明支持）
+   - 是否出现 `loadedmetadata`
+   - 是否出现 `video error`（含 `code`）
+   - 是否触发 `play reject`/`retry reject`
+4. 结论判定建议：
+   - 若 `video error` 且 `canPlay*` 为空，优先怀疑编码兼容（需转码样本验证）。
+   - 若只有 `waiting/stalled`，优先排查资源读取/URL 生命周期问题。
+
 
