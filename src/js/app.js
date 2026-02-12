@@ -1157,7 +1157,8 @@ function openLiveVideoInline(item) {
   if (!video) return;
   const previewImage = state.viewer?.image || null;
   if (video.src) URL.revokeObjectURL(video.src);
-  const videoUrl = URL.createObjectURL(item.videoBlob);
+  const blobToPlay = item._audioStrippedBlob || item.videoBlob;
+  const videoUrl = URL.createObjectURL(blobToPlay);
   video.playsInline = true;
   video.preload = 'auto';
   video.controls = false;
@@ -1167,15 +1168,15 @@ function openLiveVideoInline(item) {
   video.volume = state.liveMuted ? 0 : 1;
   console.debug('[live-debug] open', {
     name: item.name,
-    blobType: item.videoBlob?.type || '(empty)',
-    blobSize: item.videoBlob?.size || 0,
+    blobType: blobToPlay?.type || '(empty)',
+    blobSize: blobToPlay?.size || 0,
     muted: video.muted,
     isAndroid: !!platformInfo?.isAndroid,
     canPlayMp4: video.canPlayType('video/mp4'),
     canPlayQuickTime: video.canPlayType('video/quicktime')
   });
   if (platformInfo?.isAndroid) {
-    detectMp4Tracks(item.videoBlob).then((info) => {
+    detectMp4Tracks(blobToPlay).then((info) => {
       console.debug('[live-debug] mp4 tracks', {
         name: item.name,
         audio: info.audio,
