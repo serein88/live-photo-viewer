@@ -1127,7 +1127,10 @@ function updateLiveButton() {
       muteBtn.dataset.muted = String(state.liveMuted);
       const layer = document.querySelector('.viewer-live-video');
       const video = layer?.querySelector('video');
-      if (video) video.muted = state.liveMuted;
+      if (video) {
+        video.muted = state.liveMuted;
+        video.volume = state.liveMuted ? 0 : 1;
+      }
     });
     const slot = container.querySelector('.topbar-live-slot');
     if (slot) slot.appendChild(muteBtn); else container.appendChild(muteBtn);
@@ -1161,6 +1164,7 @@ function openLiveVideoInline(item) {
   video.src = videoUrl;
   video.currentTime = 0;
   video.muted = state.liveMuted;
+  video.volume = state.liveMuted ? 0 : 1;
   console.debug('[live-debug] open', {
     name: item.name,
     blobType: item.videoBlob?.type || '(empty)',
@@ -1170,6 +1174,17 @@ function openLiveVideoInline(item) {
     canPlayMp4: video.canPlayType('video/mp4'),
     canPlayQuickTime: video.canPlayType('video/quicktime')
   });
+  if (platformInfo?.isAndroid) {
+    detectMp4Tracks(item.videoBlob).then((info) => {
+      console.debug('[live-debug] mp4 tracks', {
+        name: item.name,
+        audio: info.audio,
+        video: info.video,
+        tracks: info.tracks,
+        stripped: !!item._audioStrippedBlob
+      });
+    });
+  }
   video.onloadedmetadata = () => {
     console.debug('[live-debug] loadedmetadata', {
       name: item.name,
@@ -1199,12 +1214,11 @@ function openLiveVideoInline(item) {
       message: mediaError?.message || '(no-message)'
     });
     const message = mediaError?.message || '';
-    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message) && !item._audioStripped) {
-      item._audioStripped = true;
+    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message) && !item._audioStrippedBlob) {
       const stripped = await stripMp4AudioTrack(item.videoBlob);
       if (stripped) {
         console.debug('[live-debug] strip audio retry', { name: item.name, before: item.videoBlob.size, after: stripped.size });
-        item.videoBlob = stripped;
+        item._audioStrippedBlob = stripped;
         if (video.src) URL.revokeObjectURL(video.src);
         video.src = URL.createObjectURL(stripped);
         video.currentTime = 0;
@@ -1799,6 +1813,31 @@ function concatBytes(chunks) {
     offset += chunk.byteLength;
   }
   return out;
+}
+
+async function detectMp4Tracks(blob) {
+  try {
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const top = parseBoxes(bytes);
+    const moov = top.find(box => box.type === 'moov');
+    if (!moov || !moov.children) return { audio: false, video: false, tracks: 0 };
+    let audio = false;
+    let video = false;
+    let tracks = 0;
+    for (const child of moov.children) {
+      if (child.type !== 'trak') continue;
+      tracks += 1;
+      const mdia = findChildBox(child, 'mdia');
+      const hdlr = mdia ? findChildBox(mdia, 'hdlr') : null;
+      const handler = readHandlerType(bytes, hdlr);
+      if (handler === 'soun') audio = true;
+      if (handler === 'vide') video = true;
+    }
+    return { audio, video, tracks };
+  } catch {
+    return { audio: false, video: false, tracks: 0 };
+  }
 }
 
 async function stripMp4AudioTrack(blob) {
