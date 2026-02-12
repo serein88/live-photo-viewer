@@ -1659,6 +1659,16 @@ function isFtypHeader(buf) {
   return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
 }
 
+async function findFtypAround(file, center, windowSize = 512 * 1024) {
+  const half = Math.floor(windowSize / 2);
+  const start = Math.max(0, center - half);
+  const buf = await readBytesAt(file, start, windowSize);
+  if (!buf) return -1;
+  const rel = findMp4FtypOffset(buf);
+  if (rel < 0) return -1;
+  return start + rel;
+}
+
 async function readTailText(file, size) {
   const { buffer } = await readTailBytes(file, size);
   return new TextDecoder('latin1').decode(new Uint8Array(buffer));
@@ -1685,10 +1695,20 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
     if (fromStart > 0 && fromStart < file.size - 12) candidates.push(fromStart);
     if (fromEnd > 0 && fromEnd < file.size - 12) candidates.push(fromEnd);
     for (const offset of candidates) {
+      let chosen = -1;
       const head = await readBytesAt(file, offset, 16);
-      if (!isFtypHeader(head)) continue;
-      if (file.size - offset < minBytes) continue;
-      const tail = await file.slice(offset).arrayBuffer();
+      if (isFtypHeader(head)) {
+        chosen = offset;
+      } else {
+        const around = await findFtypAround(file, offset, 512 * 1024);
+        if (around >= 0) chosen = around;
+      }
+      if (chosen < 0) continue;
+      if (file.size - chosen < minBytes) continue;
+      const tail = await file.slice(chosen).arrayBuffer();
+      if (platformInfo.isAndroid) {
+        console.debug('[live-debug] extract offset', { method: 'microOffset', offset: chosen, fileSize: file.size });
+      }
       return new Blob([tail], { type: 'video/mp4' });
     }
   }
@@ -1702,6 +1722,9 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
       const head = await readBytesAt(file, offset, 16);
       if (isFtypHeader(head)) {
         const tail = await file.slice(offset).arrayBuffer();
+        if (platformInfo.isAndroid) {
+          console.debug('[live-debug] extract offset', { method: 'tail-ftyp', offset, fileSize: file.size });
+        }
         return new Blob([tail], { type: 'video/mp4' });
       }
     }
