@@ -1838,13 +1838,20 @@ function analyzeFile(file, byBase) {
 
       let videoBlob = null;
       const needsDeepScan = shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
-      if (!needsDeepScan) {
+      // Prefer file-based extraction so we can refine offsets without loading full file.
+      if (needsDeepScan || microOffset != null) {
+        videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
+      }
+      if (!videoBlob && !needsDeepScan) {
         // Honor and similar vendors may store MP4 in the middle without MotionPhoto XMP tags.
         videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
       }
       if (!videoBlob && needsDeepScan) {
         const full = await file.arrayBuffer();
         videoBlob = extractEmbeddedVideo(full, microOffset);
+        if (videoBlob && platformInfo.isAndroid) {
+          console.debug('[live-debug] extract offset', { method: 'full-scan', offset: microOffset ?? null, fileSize: file.size });
+        }
       }
       if (videoBlob) {
         item.isLive = true;
