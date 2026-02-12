@@ -1631,10 +1631,26 @@ function findMp4FtypOffset(buf) {
   return -1;
 }
 
+function findLastMp4FtypOffset(buf) {
+  const bytes = new Uint8Array(buf);
+  for (let i = bytes.length - 12; i >= 0; i--) {
+    if (bytes[i + 4] === 0x66 && bytes[i + 5] === 0x74 && bytes[i + 6] === 0x79 && bytes[i + 7] === 0x70) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 async function readBytesAt(file, offset, size) {
   if (offset < 0 || offset >= file.size) return null;
   const slice = file.slice(offset, Math.min(offset + size, file.size));
   return slice.arrayBuffer();
+}
+
+async function readTailBytes(file, size) {
+  const start = Math.max(0, file.size - size);
+  const slice = file.slice(start, file.size);
+  return { buffer: await slice.arrayBuffer(), start };
 }
 
 function isFtypHeader(buf) {
@@ -1657,6 +1673,20 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
       if (file.size - offset < minBytes) continue;
       const tail = await file.slice(offset).arrayBuffer();
       return new Blob([tail], { type: 'video/mp4' });
+    }
+  }
+  // Prefer ftyp in tail (common for embedded video at end of JPEG).
+  const tailSize = Math.min(file.size, 8 * 1024 * 1024);
+  const tailProbe = await readTailBytes(file, tailSize);
+  const tailRel = findLastMp4FtypOffset(tailProbe.buffer);
+  if (tailRel >= 0) {
+    const offset = tailProbe.start + tailRel;
+    if (file.size - offset >= minBytes) {
+      const head = await readBytesAt(file, offset, 16);
+      if (isFtypHeader(head)) {
+        const tail = await file.slice(offset).arrayBuffer();
+        return new Blob([tail], { type: 'video/mp4' });
+      }
     }
   }
   const probeSizes = [1024 * 1024, 4 * 1024 * 1024];
