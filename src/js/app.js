@@ -79,6 +79,11 @@ if (!supportsFolder && !platformInfo.isIOS) {
   el.folderBtn.disabled = true;
   el.folderBtn.title = 'This browser does not support folder selection. Please use multi-file selection.';
 }
+if (platformInfo.isAndroid) {
+  // Android strategy: prefer native multi-file picker for better Live compatibility.
+  el.folderBtn.title = '选择照片（多选）';
+  el.folderBtn.setAttribute('aria-label', '选择照片（多选）');
+}
 
 function applyLayout(mode) {
   const m = mode === 'auto' ? (window.matchMedia('(max-width: 800px)').matches ? 'mobile' : 'desktop') : mode;
@@ -130,8 +135,71 @@ function isVideoFile(file) {
   return VIDEO_EXTS.has(ext);
 }
 
+function getBrowserHint() {
+  const ua = navigator.userAgent || '';
+  if (/EdgA\//i.test(ua)) return 'edge-android';
+  if (/Chrome\//i.test(ua) && /Android/i.test(ua)) return 'chrome-android';
+  if (/VIA/i.test(ua)) return 'via';
+  if (/MQQBrowser/i.test(ua)) return 'qqbrowser';
+  if (/UCBrowser/i.test(ua)) return 'uc';
+  return 'unknown';
+}
+
+function diagnosePickerSource(files, source) {
+  const list = Array.isArray(files) ? files : [];
+  const count = list.length;
+  const browser = getBrowserHint();
+  const relativeCount = list.reduce((acc, f) => acc + ((f?.webkitRelativePath || '').length > 0 ? 1 : 0), 0);
+  const relativeSample = list.find(f => (f?.webkitRelativePath || '').length > 0)?.webkitRelativePath || '';
+  const typeMissingCount = list.reduce((acc, f) => acc + (f?.type ? 0 : 1), 0);
+  const imageCount = list.reduce((acc, f) => acc + (isImageFile(f) ? 1 : 0), 0);
+  const videoCount = list.reduce((acc, f) => acc + (isVideoFile(f) ? 1 : 0), 0);
+
+  let inferredPicker = 'unknown';
+  let confidence = 'low';
+  const reasons = [];
+
+  if (source === 'dir' || relativeCount > 0) {
+    inferredPicker = 'directory-picker';
+    confidence = 'high';
+    reasons.push('webkitRelativePath present or source=dir');
+  } else if (platformInfo.isAndroid && source === 'file') {
+    if (browser === 'via' || browser === 'qqbrowser' || browser === 'uc') {
+      inferredPicker = 'vendor-custom-likely';
+      confidence = 'medium';
+      reasons.push(`browser=${browser}`);
+    } else if (browser === 'chrome-android' || browser === 'edge-android') {
+      inferredPicker = 'android-native-likely';
+      confidence = 'medium';
+      reasons.push(`browser=${browser}`);
+    } else {
+      inferredPicker = 'android-unknown';
+      confidence = 'low';
+      reasons.push('android + file picker, browser unknown');
+    }
+  }
+
+  const result = {
+    source,
+    platform: platformInfo,
+    browser,
+    fileCount: count,
+    imageCount,
+    videoCount,
+    missingTypeCount: typeMissingCount,
+    relativeCount,
+    relativeSample,
+    inferredPicker,
+    confidence,
+    reasons
+  };
+  console.debug('[picker-debug] diagnose', result);
+  return result;
+}
+
 async function handleSelectedFiles(files, source) {
   if (!files || !files.length) return;
+  diagnosePickerSource(files, source);
   if (files.length >= 1 && files.every(isBundleFile)) {
     setStatus('MCP bundle detected, loading...');
     let loadedAll = [];
@@ -230,18 +298,47 @@ function openFilePickerFallback() {
   el.filePicker.click();
 }
 
+function pickFilesWithInput(options = {}) {
+  const {
+    accept = '',
+    multiple = true,
+    mode = 'generic'
+  } = options;
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = !!multiple;
+    if (accept) input.accept = accept;
+    input.style.position = 'fixed';
+    input.style.left = '0';
+    input.style.top = '0';
+    input.style.width = '1px';
+    input.style.height = '1px';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    input.addEventListener('change', () => {
+      const files = Array.from(input.files || []);
+      console.debug('[dir-pick] dynamic file picker', { mode, count: files.length, accept: accept || '(none)' });
+      input.remove();
+      resolve(files);
+    }, { once: true });
+    input.click();
+  });
+}
+
 async function pickDirectoryByPlatform() {
   const env = platformInfo;
   console.debug('[dir-pick] platform', env);
   if (env.isIOS) {
     setStatus('iOS 涓嶆敮鎸佺洰褰曢€夋嫨锛屽凡鍒囨崲涓哄鏂囦欢閫夋嫨');
     openFilePickerFallback();
-    return [];
+    return null;
   }
-  // On Android, prefer webkitdirectory to avoid a second picker flow.
-  if (env.isAndroid && supportsWebkitDir) {
-    const files = await pickDirectoryWithInput();
-    console.debug('[dir-pick] android webkitdirectory files', files.length);
+  if (env.isAndroid) {
+    // Strategy #3: force Android system-like multi-file picker by omitting accept filter.
+    setStatus('Android: 使用系统文件多选模式导入');
+    console.debug('[dir-pick] android strategy=multi-file-native');
+    const files = await pickFilesWithInput({ accept: '', multiple: true, mode: 'android-native-multi' });
     return files;
   }
   if (supportsDirectoryPicker) {
@@ -266,8 +363,10 @@ async function pickDirectoryByPlatform() {
 }
 el.folderBtn.addEventListener('click', async () => {
   const files = await pickDirectoryByPlatform();
-  if (files.length) {
-    handleSelectedFiles(files, 'dir');
+  if (Array.isArray(files) && files.length) {
+    handleSelectedFiles(files, platformInfo.isAndroid ? 'file' : 'dir');
+  } else if (files === null) {
+    return;
   } else if (!platformInfo.isIOS) {
     setStatus('宸插彇娑堟枃浠跺す閫夋嫨');
   }
@@ -1131,6 +1230,13 @@ function updateLiveButton() {
         video.muted = state.liveMuted;
         video.volume = state.liveMuted ? 0 : 1;
       }
+      // On Android, when user explicitly unmutes, re-open using original blob first.
+      if (!state.liveMuted && platformInfo?.isAndroid && state.viewer) {
+        const item = state.filtered[state.viewer.index];
+        if (item?.isLive && item.videoBlob && item._audioStrippedBlob && layer?.classList.contains('active')) {
+          openLiveVideoInline(item);
+        }
+      }
     });
     const slot = container.querySelector('.topbar-live-slot');
     if (slot) slot.appendChild(muteBtn); else container.appendChild(muteBtn);
@@ -1157,7 +1263,9 @@ function openLiveVideoInline(item) {
   if (!video) return;
   const previewImage = state.viewer?.image || null;
   if (video.src) URL.revokeObjectURL(video.src);
-  const blobToPlay = item._audioStrippedBlob || item.videoBlob;
+  const preferOriginalAudio = !!(platformInfo?.isAndroid && !state.liveMuted);
+  const blobToPlay = preferOriginalAudio ? item.videoBlob : (item._audioStrippedBlob || item.videoBlob);
+  const sourceMode = blobToPlay === item.videoBlob ? 'original' : 'stripped';
   const videoUrl = URL.createObjectURL(blobToPlay);
   video.playsInline = true;
   video.preload = 'auto';
@@ -1170,6 +1278,7 @@ function openLiveVideoInline(item) {
     name: item.name,
     blobType: blobToPlay?.type || '(empty)',
     blobSize: blobToPlay?.size || 0,
+    sourceMode,
     muted: video.muted,
     isAndroid: !!platformInfo?.isAndroid,
     canPlayMp4: video.canPlayType('video/mp4'),
@@ -1215,11 +1324,20 @@ function openLiveVideoInline(item) {
       message: mediaError?.message || '(no-message)'
     });
     const message = mediaError?.message || '';
-    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message) && !item._audioStrippedBlob) {
-      const stripped = await stripMp4AudioTrack(item.videoBlob);
-      if (stripped) {
-        console.debug('[live-debug] strip audio retry', { name: item.name, before: item.videoBlob.size, after: stripped.size });
-        item._audioStrippedBlob = stripped;
+    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message)) {
+      let stripped = item._audioStrippedBlob || null;
+      if (!stripped) {
+        stripped = await stripMp4AudioTrack(item.videoBlob);
+        if (stripped) {
+          console.debug('[live-debug] strip audio retry', { name: item.name, before: item.videoBlob.size, after: stripped.size });
+          item._audioStrippedBlob = stripped;
+        } else {
+          console.debug('[live-debug] strip audio skipped', { name: item.name });
+        }
+      } else {
+        console.debug('[live-debug] use cached stripped', { name: item.name, sourceMode });
+      }
+      if (stripped && blobToPlay !== stripped) {
         if (video.src) URL.revokeObjectURL(video.src);
         video.src = URL.createObjectURL(stripped);
         video.currentTime = 0;
@@ -1231,7 +1349,6 @@ function openLiveVideoInline(item) {
         });
         return;
       }
-      console.debug('[live-debug] strip audio skipped', { name: item.name });
     }
     if (previewImage) {
       previewImage.style.opacity = '';
