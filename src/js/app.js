@@ -1153,6 +1153,7 @@ function openLiveVideoInline(item) {
   const video = layer.querySelector('video');
   if (!video) return;
   const previewImage = state.viewer?.image || null;
+  if (video.src) URL.revokeObjectURL(video.src);
   const videoUrl = URL.createObjectURL(item.videoBlob);
   video.playsInline = true;
   video.preload = 'auto';
@@ -1190,13 +1191,33 @@ function openLiveVideoInline(item) {
   video.onstalled = () => {
     console.debug('[live-debug] stalled', { name: item.name, t: video.currentTime });
   };
-  video.onerror = () => {
+  video.onerror = async () => {
     const mediaError = video.error;
     console.debug('[live-debug] video error', {
       name: item.name,
       code: mediaError?.code || null,
       message: mediaError?.message || '(no-message)'
     });
+    const message = mediaError?.message || '';
+    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message) && !item._audioStripped) {
+      item._audioStripped = true;
+      const stripped = await stripMp4AudioTrack(item.videoBlob);
+      if (stripped) {
+        console.debug('[live-debug] strip audio retry', { name: item.name, before: item.videoBlob.size, after: stripped.size });
+        item.videoBlob = stripped;
+        if (video.src) URL.revokeObjectURL(video.src);
+        video.src = URL.createObjectURL(stripped);
+        video.currentTime = 0;
+        video.play().catch((retryErr) => {
+          console.debug('[live-debug] strip retry reject', {
+            name: item.name,
+            message: retryErr?.message || String(retryErr)
+          });
+        });
+        return;
+      }
+      console.debug('[live-debug] strip audio skipped', { name: item.name });
+    }
     if (previewImage) {
       previewImage.style.opacity = '';
     }
@@ -1667,6 +1688,20 @@ function readBoxSize(bytes, offset) {
   return size;
 }
 
+function readBoxSizeWithHeader(bytes, offset) {
+  let size = readU32BE(bytes, offset);
+  let header = 8;
+  if (size === 1) {
+    const big = readU64BE(bytes, offset + 8);
+    if (big == null) return { size: null, header };
+    size = big;
+    header = 16;
+  } else if (size === 0) {
+    size = bytes.length - offset;
+  }
+  return { size, header };
+}
+
 function findBoxOffset(bytes, type, start = 0, end = null) {
   const max = end == null ? bytes.length - 8 : Math.min(end, bytes.length - 8);
   for (let i = Math.max(0, start); i <= max; i++) {
@@ -1699,6 +1734,115 @@ function validateMp4At(bytes, offset) {
     if (sawFtyp && sawMoov) return { valid: true, sawMdat };
   }
   return { valid: sawFtyp && sawMoov, sawMdat };
+}
+
+const CONTAINER_BOXES = new Set([
+  'moov', 'trak', 'mdia', 'minf', 'stbl', 'edts', 'udta', 'meta', 'ilst', 'dinf', 'mvex', 'moof', 'traf'
+]);
+
+function parseBoxes(bytes, start = 0, end = null) {
+  const limit = end == null ? bytes.length : Math.min(end, bytes.length);
+  const boxes = [];
+  let pos = Math.max(0, start);
+  while (pos + 8 <= limit) {
+    const { size, header } = readBoxSizeWithHeader(bytes, pos);
+    if (size == null || size < 8) break;
+    const boxEnd = pos + size;
+    if (boxEnd > limit) break;
+    const type = readBoxType(bytes, pos);
+    const box = { type, start: pos, size, header, end: boxEnd, children: null };
+    if (CONTAINER_BOXES.has(type)) {
+      let childStart = pos + header;
+      if (type === 'meta') childStart += 4;
+      if (childStart < boxEnd) {
+        box.children = parseBoxes(bytes, childStart, boxEnd);
+      }
+    }
+    boxes.push(box);
+    pos = boxEnd;
+  }
+  return boxes;
+}
+
+function findChildBox(box, type) {
+  if (!box?.children) return null;
+  return box.children.find(child => child.type === type) || null;
+}
+
+function readHandlerType(bytes, hdlrBox) {
+  if (!hdlrBox) return null;
+  const base = hdlrBox.start + hdlrBox.header;
+  if (base + 12 > hdlrBox.end) return null;
+  return String.fromCharCode(bytes[base + 8], bytes[base + 9], bytes[base + 10], bytes[base + 11]);
+}
+
+function buildBox(type, payloadBytes) {
+  const payload = payloadBytes || new Uint8Array(0);
+  const size = 8 + payload.byteLength;
+  const buf = new Uint8Array(size);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, size);
+  buf[4] = type.charCodeAt(0);
+  buf[5] = type.charCodeAt(1);
+  buf[6] = type.charCodeAt(2);
+  buf[7] = type.charCodeAt(3);
+  buf.set(payload, 8);
+  return buf;
+}
+
+function concatBytes(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+async function stripMp4AudioTrack(blob) {
+  try {
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const top = parseBoxes(bytes);
+    const moov = top.find(box => box.type === 'moov');
+    if (!moov || !moov.children) return null;
+
+    const keptChildren = [];
+    let droppedAudio = false;
+    let hasVideo = false;
+    for (const child of moov.children) {
+      if (child.type !== 'trak') {
+        keptChildren.push(bytes.slice(child.start, child.end));
+        continue;
+      }
+      const mdia = findChildBox(child, 'mdia');
+      const hdlr = mdia ? findChildBox(mdia, 'hdlr') : null;
+      const handler = readHandlerType(bytes, hdlr);
+      if (handler === 'soun') {
+        droppedAudio = true;
+        continue;
+      }
+      if (handler === 'vide') hasVideo = true;
+      keptChildren.push(bytes.slice(child.start, child.end));
+    }
+    if (!droppedAudio || !hasVideo) return null;
+
+    const newMoovPayload = concatBytes(keptChildren);
+    const newMoov = buildBox('moov', newMoovPayload);
+    const rebuilt = [];
+    for (const box of top) {
+      if (box.type === 'moov') {
+        rebuilt.push(newMoov);
+      } else {
+        rebuilt.push(bytes.slice(box.start, box.end));
+      }
+    }
+    return new Blob(rebuilt, { type: 'video/mp4' });
+  } catch {
+    return null;
+  }
 }
 
 function trimMp4Buffer(buf) {
