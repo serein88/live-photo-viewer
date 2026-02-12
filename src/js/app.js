@@ -14,6 +14,7 @@
   userAdjusted: false,
   viewerUrlCache: new Map(),
   currentViewerIndex: -1,
+  scanByBase: null,
 };
 const EXIF_SLICE_SIZE = 256 * 1024;
 let renderTimer = null;
@@ -111,6 +112,28 @@ function updateStats() {
 
 function setStatus(text) { el.status.textContent = text; }
 
+function preShowScanOverlay(total = 0, label = 'Indexing') {
+  let mask = document.getElementById('scanOverlay');
+  if (!mask) {
+    mask = document.createElement('div');
+    mask.id = 'scanOverlay';
+    mask.className = 'scan-overlay hidden';
+    mask.innerHTML = '<div class="scan-card"><div class="scan-spinner" aria-hidden="true"></div><div id="scanText" class="scan-text">Scanning...</div><div class="scan-bar"><div id="scanBar" class="scan-bar-inner"></div></div></div>';
+    document.body.appendChild(mask);
+  }
+  const txt = mask.querySelector('#scanText');
+  const bar = mask.querySelector('#scanBar');
+  const t = Math.max(1, Number(total) || 1);
+  if (txt) txt.textContent = `${label} 0/${t} (0%)`;
+  if (bar) bar.style.width = '0%';
+  mask.classList.remove('hidden');
+}
+
+function preHideScanOverlay() {
+  const mask = document.getElementById('scanOverlay');
+  if (mask) mask.classList.add('hidden');
+}
+
 function setFilter(f) {
   state.filter = f;
   renderGrid();
@@ -148,12 +171,15 @@ function getBrowserHint() {
 function diagnosePickerSource(files, source) {
   const list = Array.isArray(files) ? files : [];
   const count = list.length;
+  const sampleLimit = 400;
+  const sampled = count > sampleLimit ? list.slice(0, sampleLimit) : list;
+  const sampleCount = sampled.length;
   const browser = getBrowserHint();
-  const relativeCount = list.reduce((acc, f) => acc + ((f?.webkitRelativePath || '').length > 0 ? 1 : 0), 0);
-  const relativeSample = list.find(f => (f?.webkitRelativePath || '').length > 0)?.webkitRelativePath || '';
-  const typeMissingCount = list.reduce((acc, f) => acc + (f?.type ? 0 : 1), 0);
-  const imageCount = list.reduce((acc, f) => acc + (isImageFile(f) ? 1 : 0), 0);
-  const videoCount = list.reduce((acc, f) => acc + (isVideoFile(f) ? 1 : 0), 0);
+  const relativeCount = sampled.reduce((acc, f) => acc + ((f?.webkitRelativePath || '').length > 0 ? 1 : 0), 0);
+  const relativeSample = sampled.find(f => (f?.webkitRelativePath || '').length > 0)?.webkitRelativePath || '';
+  const typeMissingCount = sampled.reduce((acc, f) => acc + (f?.type ? 0 : 1), 0);
+  const imageCount = sampled.reduce((acc, f) => acc + (isImageFile(f) ? 1 : 0), 0);
+  const videoCount = sampled.reduce((acc, f) => acc + (isVideoFile(f) ? 1 : 0), 0);
 
   let inferredPicker = 'unknown';
   let confidence = 'low';
@@ -184,6 +210,7 @@ function diagnosePickerSource(files, source) {
     platform: platformInfo,
     browser,
     fileCount: count,
+    sampleCount,
     imageCount,
     videoCount,
     missingTypeCount: typeMissingCount,
@@ -198,12 +225,22 @@ function diagnosePickerSource(files, source) {
 }
 
 async function handleSelectedFiles(files, source) {
-  if (!files || !files.length) return;
-  diagnosePickerSource(files, source);
-  if (files.length >= 1 && files.every(isBundleFile)) {
+  if (!files || !files.length) {
+    preHideScanOverlay();
+    return;
+  }
+  const incomingCount = Number(files.length) || 0;
+  if (platformInfo.isAndroid && incomingCount > 0 && source !== 'mcp') {
+    preShowScanOverlay(incomingCount, 'Indexing');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+  const normalized = Array.isArray(files) ? files : Array.from(files || []);
+  setTimeout(() => diagnosePickerSource(normalized, source), 0);
+  if (normalized.length >= 1 && normalized.every(isBundleFile)) {
     setStatus('MCP bundle detected, loading...');
     let loadedAll = [];
-    for (const f of files) {
+    for (const f of normalized) {
       const loaded = await loadBundle(f);
       loadedAll = loadedAll.concat(loaded);
     }
@@ -216,7 +253,7 @@ async function handleSelectedFiles(files, source) {
     }
     return;
   }
-  state.files = files;
+  state.files = normalized;
   if (source === 'dir') {
     setStatus(`Folder selected: ${state.files.length} files`);
   } else if (source === 'mcp') {
@@ -224,7 +261,11 @@ async function handleSelectedFiles(files, source) {
   } else {
     setStatus(`Selected ${state.files.length} files, scanning...`);
   }
-  startScan();
+  if (platformInfo.isAndroid) {
+    setTimeout(() => startScan(), 0);
+  } else {
+    startScan();
+  }
 }
 
 function isBundleFile(file) {
@@ -284,13 +325,13 @@ el.sortSelect.addEventListener('change', () => {
 });
 
 el.filePicker.addEventListener('change', () => {
-  handleSelectedFiles(Array.from(el.filePicker.files || []), 'file');
+  handleSelectedFiles(el.filePicker.files || [], 'file');
 });
 el.dirPicker.addEventListener('change', () => {
-  handleSelectedFiles(Array.from(el.dirPicker.files || []), 'dir');
+  handleSelectedFiles(el.dirPicker.files || [], 'dir');
 });
 el.mcpFiles.addEventListener('change', () => {
-  handleSelectedFiles(Array.from(el.mcpFiles.files || []), 'mcp');
+  handleSelectedFiles(el.mcpFiles.files || [], 'mcp');
 });
 
 function openFilePickerFallback() {
@@ -316,6 +357,9 @@ function pickFilesWithInput(options = {}) {
     input.style.height = '1px';
     input.style.opacity = '0';
     document.body.appendChild(input);
+    if (platformInfo.isAndroid) {
+      preShowScanOverlay(1, 'Waiting for selection');
+    }
     input.addEventListener('change', () => {
       const files = Array.from(input.files || []);
       console.debug('[dir-pick] dynamic file picker', { mode, count: files.length, accept: accept || '(none)' });
@@ -366,9 +410,11 @@ el.folderBtn.addEventListener('click', async () => {
   if (Array.isArray(files) && files.length) {
     handleSelectedFiles(files, platformInfo.isAndroid ? 'file' : 'dir');
   } else if (files === null) {
+    preHideScanOverlay();
     return;
   } else if (!platformInfo.isIOS) {
     setStatus('宸插彇娑堟枃浠跺す閫夋嫨');
+    preHideScanOverlay();
   }
 });
 
@@ -744,6 +790,31 @@ function updateViewerGallery() {
 function openViewer(id) {
   const index = state.filtered.findIndex(i => i.id === id);
   if (index === -1) return;
+  const currentItem = state.filtered[index];
+  if (currentItem && !currentItem._scanDone && state.scanByBase) {
+    analyzeFile(currentItem.file, state.scanByBase).then((analyzed) => {
+      if (!analyzed || currentItem._scanDone) return;
+      currentItem.isLive = !!analyzed.isLive;
+      currentItem.liveType = analyzed.liveType || (currentItem.isLive ? 'Embedded Video' : 'Still');
+      currentItem.videoBlob = analyzed.videoBlob || null;
+      currentItem.exif = analyzed.exif || currentItem.exif || null;
+      currentItem.exifTime = analyzed.exifTime ?? currentItem.exifTime ?? null;
+      currentItem.exifChecked = analyzed.exifChecked || currentItem.exifChecked;
+      currentItem._scanDone = true;
+      const card = el.grid.querySelector(`.card[data-id="${currentItem.id}"]`);
+      if (card && currentItem.isLive && !card.querySelector('.live-icon')) {
+        const badge = document.createElement('div');
+        badge.className = 'live-icon';
+        badge.title = 'Live Photo';
+        card.insertBefore(badge, card.firstChild);
+      }
+      updateStats();
+      if (state.viewer && state.filtered[state.viewer.index]?.id === currentItem.id) {
+        updateLiveButton();
+        updateViewerPanel();
+      }
+    }).catch(() => {});
+  }
   state.currentViewerIndex = index;
   if (!el.viewerGallery.children.length || el.viewerGallery.children.length !== state.filtered.length) {
     updateViewerGallery();
@@ -2188,6 +2259,10 @@ function shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset) {
   return false;
 }
 
+function isLikelyLiveName(name) {
+  return /(live|motion|mvimg|microvideo|livephoto|motionphoto)/i.test(name || '');
+}
+
 async function scanFiles(files) {
   const items = [];
   const byBase = new Map();
@@ -2227,15 +2302,12 @@ function analyzeFile(file, byBase) {
     }
 
     try {
-      const headReadSize = platformInfo.isAndroid ? 256 * 1024 : 512 * 1024;
+      const likelyByName = isLikelyLiveName(file.name);
+      const needExifNow = (state.sortKey || '').startsWith('shot') || likelyByName;
+      // Keep Android fast path smaller; use larger head on desktop for better vendor/exif coverage.
+      const headReadSize = platformInfo.isAndroid ? 160 * 1024 : 512 * 1024;
       const head = await readHeadBytes(file, headReadSize);
       const xmp = extractXmp(head);
-      const exif = extractExif(head);
-      item.exifChecked = true;
-      if (exif && Object.keys(exif).length) {
-        item.exif = exif;
-        item.exifTime = parseExifTime(exif);
-      }
 
       let vendorType = null;
       let hasMotionTag = false;
@@ -2248,25 +2320,36 @@ function analyzeFile(file, byBase) {
         if (/OPPO|oppo/i.test(xmp)) vendorType = 'OPPO Live Photo';
         if (/HONOR|honor/i.test(xmp)) vendorType = 'HONOR Live Photo';
       }
-      const makeText = String(exif?.Make || '').toLowerCase();
-      const modelText = String(exif?.Model || '').toLowerCase();
-      if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) vendorType = 'HONOR Live Photo';
 
-      if (microOffset == null) {
+      // HONOR-style Live detection depends on EXIF Make/Model, so parse EXIF broadly on desktop.
+      const shouldParseExif = true;
+      if (shouldParseExif) {
+        const exif = extractExif(head);
+        item.exifChecked = true;
+        if (exif && Object.keys(exif).length) {
+          item.exif = exif;
+          item.exifTime = parseExifTime(exif);
+        }
+        const makeText = String(exif?.Make || '').toLowerCase();
+        const modelText = String(exif?.Model || '').toLowerCase();
+        if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) {
+          vendorType = 'HONOR Live Photo';
+          console.debug('[live-detect] honor exif', { name: file.name, make: exif?.Make || '', model: exif?.Model || '' });
+        }
+      }
+
+      const likelyLive = hasMotionTag || !!vendorType || likelyByName;
+      if (microOffset == null && likelyLive) {
         microOffset = await parseMicroOffsetFromTail(file);
       }
 
       let videoBlob = null;
-      const needsDeepScan = shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
-      // Prefer file-based extraction so we can refine offsets without loading full file.
+      const needsDeepScan = likelyLive || shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
       if (needsDeepScan || microOffset != null) {
         videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
       }
-      if (!videoBlob && !needsDeepScan) {
-        // Honor and similar vendors may store MP4 in the middle without MotionPhoto XMP tags.
-        videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
-      }
-      if (!videoBlob && needsDeepScan) {
+      // Full-file scan is expensive; avoid it on Android unless we have strong hints.
+      if (!videoBlob && needsDeepScan && (!platformInfo.isAndroid || hasMotionTag || microOffset != null)) {
         const full = await file.arrayBuffer();
         videoBlob = extractEmbeddedVideo(full, microOffset);
         if (videoBlob && platformInfo.isAndroid) {
@@ -2323,6 +2406,161 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 // Scan overlay + incremental grid rendering overrides
 (function () {
   if (!state.itemById) state.itemById = new Map();
+  let activeScanToken = 0;
+  const thumbQueue = [];
+  let thumbInFlight = 0;
+  let gridScrollHandler = null;
+
+  function getThumbConcurrency() {
+    if (platformInfo.isWindows) return 3;
+    if (platformInfo.isAndroid) return 2;
+    return 4;
+  }
+
+  function getThumbMaxEdge() {
+    if (platformInfo.isAndroid) return 320;
+    if (platformInfo.isWindows) return 360;
+    return 360;
+  }
+
+  function sortFilesForInitial(files) {
+    const key = state.sortKey || (el.sortSelect ? el.sortSelect.value : 'mtime_desc');
+    const list = files.slice();
+    const cmpNum = (a, b, desc = true) => desc ? (b - a) : (a - b);
+    if (key === 'name_asc' || key === 'name_desc') {
+      const dir = key.endsWith('_asc') ? 1 : -1;
+      list.sort((a, b) => dir * a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+      return list;
+    }
+    if (key === 'size_asc' || key === 'size_desc') {
+      const desc = key.endsWith('_desc');
+      list.sort((a, b) => cmpNum(a.size || 0, b.size || 0, desc));
+      return list;
+    }
+    // shot_* is not available before EXIF parsing; fallback to mtime for initial ordering.
+    if (key === 'mtime_asc' || key === 'shot_asc') {
+      list.sort((a, b) => cmpNum(a.lastModified || 0, b.lastModified || 0, false));
+      return list;
+    }
+    list.sort((a, b) => cmpNum(a.lastModified || 0, b.lastModified || 0, true));
+    return list;
+  }
+
+  function syncCardLiveBadge(item) {
+    const card = el.grid.querySelector(`.card[data-id="${item.id}"]`);
+    if (!card) return;
+    const exists = card.querySelector('.live-icon');
+    if (item.isLive && !exists) {
+      const badge = document.createElement('div');
+      badge.className = 'live-icon';
+      badge.title = 'Live Photo';
+      card.insertBefore(badge, card.firstChild);
+    } else if (!item.isLive && exists) {
+      exists.remove();
+    }
+  }
+
+  function queueThumbnail(item, card) {
+    if (!item || !card) return;
+    if (item._thumbQueued) return;
+    item._thumbQueued = true;
+    thumbQueue.push({ item, card });
+    drainThumbnailQueue();
+  }
+
+  function drainThumbnailQueue() {
+    const limit = getThumbConcurrency();
+    while (thumbInFlight < limit && thumbQueue.length) {
+      const task = thumbQueue.shift();
+      const item = task.item;
+      const card = task.card;
+      if (!item || !card || !card.isConnected) {
+        if (item) item._thumbQueued = false;
+        continue;
+      }
+      thumbInFlight += 1;
+      renderThumbnailTask(item, card).finally(() => {
+        item._thumbQueued = false;
+        thumbInFlight -= 1;
+        drainThumbnailQueue();
+      });
+    }
+  }
+
+  function renderThumbnailTask(item, card) {
+    return new Promise((resolve) => {
+      try {
+        const holder = card.querySelector('.thumb');
+        if (!holder || holder.querySelector('img')) {
+          resolve();
+          return;
+        }
+        const img = document.createElement('img');
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        if (item.thumbUrl) {
+          img.src = item.thumbUrl;
+          holder.textContent = '';
+          holder.appendChild(img);
+          item.thumbLoaded = true;
+          resolve();
+          return;
+        }
+
+        const srcUrl = URL.createObjectURL(item.file);
+        const source = new Image();
+        source.decoding = 'async';
+        source.onload = () => {
+          const maxEdge = getThumbMaxEdge();
+          const sw = source.naturalWidth || source.width || 1;
+          const sh = source.naturalHeight || source.height || 1;
+          const scale = Math.min(1, maxEdge / Math.max(sw, sh));
+          const tw = Math.max(1, Math.round(sw * scale));
+          const th = Math.max(1, Math.round(sh * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = tw;
+          canvas.height = th;
+          const ctx = canvas.getContext('2d', { alpha: false });
+          if (ctx) {
+            ctx.drawImage(source, 0, 0, tw, th);
+            canvas.toBlob((blob) => {
+              URL.revokeObjectURL(srcUrl);
+              if (blob) {
+                item.thumbUrl = URL.createObjectURL(blob);
+              } else {
+                item.thumbUrl = URL.createObjectURL(item.file);
+              }
+              img.src = item.thumbUrl;
+              holder.textContent = '';
+              holder.appendChild(img);
+              item.thumbLoaded = true;
+              resolve();
+            }, 'image/jpeg', 0.78);
+          } else {
+            URL.revokeObjectURL(srcUrl);
+            item.thumbUrl = URL.createObjectURL(item.file);
+            img.src = item.thumbUrl;
+            holder.textContent = '';
+            holder.appendChild(img);
+            item.thumbLoaded = true;
+            resolve();
+          }
+        };
+        source.onerror = () => {
+          URL.revokeObjectURL(srcUrl);
+          item.thumbUrl = URL.createObjectURL(item.file);
+          img.src = item.thumbUrl;
+          holder.textContent = '';
+          holder.appendChild(img);
+          item.thumbLoaded = true;
+          resolve();
+        };
+        source.src = srcUrl;
+      } catch {
+        resolve();
+      }
+    });
+  }
 
   function ensureScanOverlay() {
     let mask = document.getElementById('scanOverlay');
@@ -2345,6 +2583,23 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     mask.classList.add('hidden');
   }
 
+  function ensureGridLoadHint() {
+    let hint = document.getElementById('gridLoadHint');
+    if (hint) return hint;
+    hint = document.createElement('div');
+    hint.id = 'gridLoadHint';
+    hint.className = 'grid-load-hint hidden';
+    hint.textContent = 'Loading more...';
+    document.body.appendChild(hint);
+    return hint;
+  }
+
+  function setGridLoadHint(show, text = 'Loading more...') {
+    const hint = ensureGridLoadHint();
+    hint.textContent = text;
+    hint.classList.toggle('hidden', !show);
+  }
+
   function updateScanOverlay(done, total, label) {
     const mask = ensureScanOverlay();
     const txt = mask.querySelector('#scanText');
@@ -2355,42 +2610,133 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     if (bar) bar.style.width = `${pct}%`;
   }
 
-  async function scanFilesWithProgress(files) {
-    const items = [];
+  async function buildBaseMap(files) {
     const byBase = new Map();
-    for (const f of files) {
+    const chunk = platformInfo.isAndroid ? 40 : 800;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
       const base = f.name.replace(/\.[^/.]+$/, '').toLowerCase();
       if (!byBase.has(base)) byBase.set(base, []);
       byBase.get(base).push(f);
-    }
-
-    const queue = files.filter(isImageFile);
-    const total = queue.length;
-    const concurrency = getScanConcurrency();
-    const yieldEvery = platformInfo.isAndroid ? 8 : 24;
-    let done = 0;
-
-    updateScanOverlay(0, total, 'Scanning');
-    setStatus(`Scanning ${done}/${total}...`);
-    for (let start = 0; start < queue.length; start += concurrency) {
-      const chunk = queue.slice(start, start + concurrency);
-      const chunkItems = await Promise.all(chunk.map(file => analyzeFile(file, byBase)));
-      items.push(...chunkItems);
-      done += chunk.length;
-      updateScanOverlay(done, total, 'Scanning');
-      setStatus(`Scanning ${done}/${total}...`);
-      if (done % yieldEvery === 0) {
+      if (i === 0 || i % chunk === 0) {
+        updateScanOverlay(i, files.length, 'Indexing');
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
-    return items;
+    updateScanOverlay(files.length, Math.max(1, files.length), 'Indexing');
+    return byBase;
+  }
+
+  function createPlaceholderItem(file, byBase) {
+    const id = crypto.randomUUID();
+    const item = {
+      id,
+      name: file.name,
+      file,
+      isLive: false,
+      liveType: 'Still',
+      videoBlob: null,
+      thumbLoaded: false,
+      exif: null,
+      exifTime: null,
+      exifChecked: false,
+      objectUrl: null,
+      _scanDone: false,
+      _audioStrippedBlob: null
+    };
+    const base = file.name.replace(/\.[^/.]+$/, '').toLowerCase();
+    const siblings = byBase.get(base) || [];
+    const mov = siblings.find(f => f.name.toLowerCase().endsWith('.mov'));
+    if (mov) {
+      item.isLive = true;
+      item.liveType = 'iOS Live Photo';
+      item.videoBlob = mov.type ? mov : new Blob([mov], { type: 'video/quicktime' });
+      item._scanDone = true;
+    }
+    return item;
+  }
+
+  function mergeAnalyzedItem(target, analyzed) {
+    target.isLive = !!analyzed.isLive;
+    target.liveType = analyzed.liveType || (target.isLive ? 'Embedded Video' : 'Still');
+    target.videoBlob = analyzed.videoBlob || null;
+    target.exif = analyzed.exif || target.exif || null;
+    target.exifTime = analyzed.exifTime ?? target.exifTime ?? null;
+    target.exifChecked = analyzed.exifChecked || target.exifChecked;
+    target._scanDone = true;
+  }
+
+  async function progressiveAnalyzeItems(items, byBase, token, priorityIds = []) {
+    const pending = items.filter(i => !i._scanDone);
+    const prioritySet = new Set(priorityIds);
+    const queue = [];
+    if (prioritySet.size) {
+      for (const item of pending) {
+        if (prioritySet.has(item.id)) queue.push(item);
+      }
+      for (const item of pending) {
+        if (!prioritySet.has(item.id)) queue.push(item);
+      }
+    } else {
+      queue.push(...pending);
+    }
+    const total = items.length;
+    const baseDone = total - queue.length;
+    let done = baseDone;
+    let discoveredLive = items.filter(i => i.isLive).length;
+    const concurrency = platformInfo.isAndroid ? 3 : 3;
+    const statusTick = platformInfo.isAndroid ? 6 : 24;
+    const statTick = platformInfo.isAndroid ? 80 : 220;
+    let cursor = 0;
+
+    const updateProgress = (force = false) => {
+      if (!force && done % statusTick !== 0) return;
+      updateScanOverlay(done, total, 'Scanning');
+      setStatus(`Scanning ${done}/${total}... Live ${discoveredLive}`);
+      if (force || done % statTick === 0) updateStats();
+    };
+
+    updateProgress(true);
+
+    async function worker() {
+      while (cursor < queue.length) {
+        if (token !== activeScanToken) return;
+        const idx = cursor++;
+        const item = queue[idx];
+        const wasLive = item.isLive;
+        const analyzed = await analyzeFile(item.file, byBase);
+        if (token !== activeScanToken) return;
+        mergeAnalyzedItem(item, analyzed);
+        if (!wasLive && item.isLive) {
+          syncCardLiveBadge(item);
+        }
+        done += 1;
+        if (item.isLive) discoveredLive += 1;
+        updateProgress();
+        if (done % 8 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
+    }
+
+    const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+    await Promise.all(workers);
+    if (token !== activeScanToken) return;
+    updateProgress(true);
   }
 
   async function startScanOverride() {
-    if (!state.files.length || state.scanning) return;
+    if (!state.files.length) return;
+    const token = ++activeScanToken;
     state.scanning = true;
+    thumbQueue.length = 0;
+    thumbInFlight = 0;
     showScanOverlay();
-    setStatus('Scanning...');
+    updateScanOverlay(0, Math.max(1, state.files.length), 'Indexing');
+    setStatus('Indexing files...');
+    // Ensure overlay is painted before heavy indexing starts.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
     if (state.items.length) {
       state.items.forEach((item) => {
@@ -2405,9 +2751,34 @@ function readTagValue(view, type, count, valueOffset, little, base) {
       });
     }
 
-    state.items = await scanFilesWithProgress(state.files);
+    const byBase = await buildBaseMap(state.files);
+    state.scanByBase = byBase;
+    const queue = sortFilesForInitial(state.files.filter(isImageFile));
+    updateScanOverlay(0, Math.max(1, queue.length), 'Preparing');
+    const placeholders = [];
+    const chunk = platformInfo.isAndroid ? 80 : 900;
+    for (let i = 0; i < queue.length; i++) {
+      placeholders.push(createPlaceholderItem(queue[i], byBase));
+      if (i === 0 || i % chunk === 0) {
+        updateScanOverlay(i, queue.length, 'Preparing');
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    updateScanOverlay(queue.length, Math.max(1, queue.length), 'Preparing');
+    state.items = placeholders;
     state.itemById = new Map(state.items.map(i => [i.id, i]));
     renderGrid();
+    updateStats();
+    hideScanOverlay();
+    setStatus(`Indexed ${state.items.length} files, scanning in background...`);
+    const priorityIds = state.filtered
+      .slice(0, platformInfo.isAndroid ? 120 : 320)
+      .map(item => item.id);
+    await progressiveAnalyzeItems(state.items, byBase, token, priorityIds);
+    if (token !== activeScanToken) return;
+    if (state.filter !== 'all' || String(state.sortKey || '').startsWith('shot')) {
+      renderGrid({ skipGallery: true });
+    }
     updateStats();
     state.scanning = false;
     hideScanOverlay();
@@ -2415,22 +2786,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
   }
 
   function loadThumbnailOverride(item, card) {
-    try {
-      const holder = card.querySelector('.thumb');
-      if (!holder || holder.querySelector('img')) return;
-      const img = document.createElement('img');
-      img.loading = 'lazy';
-      img.decoding = 'async';
-      const tmpUrl = URL.createObjectURL(item.file);
-      img.src = tmpUrl;
-      img.onload = () => URL.revokeObjectURL(tmpUrl);
-      img.onerror = () => URL.revokeObjectURL(tmpUrl);
-      holder.textContent = '';
-      holder.appendChild(img);
-      item.thumbLoaded = true;
-    } catch {
-      // leave placeholder
-    }
+    queueThumbnail(item, card);
   }
 
   function renderGridOverride(options = {}) {
@@ -2438,6 +2794,10 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     if (renderTimer) {
       clearTimeout(renderTimer);
       renderTimer = null;
+    }
+    if (gridScrollHandler) {
+      window.removeEventListener('scroll', gridScrollHandler);
+      gridScrollHandler = null;
     }
 
     el.grid.innerHTML = '';
@@ -2477,56 +2837,134 @@ function readTagValue(view, type, count, valueOffset, little, base) {
 
     const groups = buildGroups(sorted);
     let index = 0;
-    const chunkSize = platformInfo.isAndroid ? 72 : 180;
+    const chunkSize = platformInfo.isAndroid ? 60 : 160;
+    const firstBurst = platformInfo.isAndroid ? 2 : 3;
+    let sentinel = null;
+    let appending = false;
+    const renderAllPlaceholders = platformInfo.isAndroid && state.scanning;
 
-    const renderChunk = () => {
-      const frag = document.createDocumentFragment();
-      let count = 0;
-      while (index < groups.length && count < chunkSize) {
-        const entry = groups[index++];
-        count++;
-        if (entry.type === 'group') {
-          const header = document.createElement('div');
-          header.className = 'group-header';
-          header.textContent = entry.label;
-          frag.appendChild(header);
-          continue;
+    const appendChunk = (times = 1) => {
+      for (let t = 0; t < times; t++) {
+        if (index >= groups.length) break;
+        const frag = document.createDocumentFragment();
+        let count = 0;
+        while (index < groups.length && count < chunkSize) {
+          const entry = groups[index++];
+          count++;
+          if (entry.type === 'group') {
+            const header = document.createElement('div');
+            header.className = 'group-header';
+            header.textContent = entry.label;
+            frag.appendChild(header);
+            continue;
+          }
+
+          const item = entry.item;
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.dataset.id = item.id;
+          if (state.selection.has(item.id)) card.classList.add('selected');
+
+          const thumb = document.createElement('div');
+          thumb.className = 'thumb';
+          thumb.textContent = 'Loading...';
+
+          if (item.isLive) {
+            const badge = document.createElement('div');
+            badge.className = 'live-icon';
+            badge.title = 'Live Photo';
+            card.appendChild(badge);
+          }
+
+          const check = document.createElement('div');
+          check.className = 'check';
+          check.textContent = state.selection.has(item.id) ? '✓' : '';
+
+          card.appendChild(thumb);
+          card.appendChild(check);
+          frag.appendChild(card);
+          observer.observe(card);
         }
-
-        const item = entry.item;
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.dataset.id = item.id;
-        if (state.selection.has(item.id)) card.classList.add('selected');
-
-        const thumb = document.createElement('div');
-        thumb.className = 'thumb';
-        thumb.textContent = 'Loading...';
-
-        if (item.isLive) {
-          const badge = document.createElement('div');
-          badge.className = 'live-icon';
-          badge.title = 'Live Photo';
-          card.appendChild(badge);
-        }
-
-        const check = document.createElement('div');
-        check.className = 'check';
-        check.textContent = state.selection.has(item.id) ? '✓' : '';
-
-        card.appendChild(thumb);
-        card.appendChild(check);
-        frag.appendChild(card);
-        observer.observe(card);
-      }
-
-      el.grid.appendChild(frag);
-      if (index < groups.length) {
-        requestAnimationFrame(renderChunk);
+        el.grid.appendChild(frag);
       }
     };
 
-    requestAnimationFrame(renderChunk);
+    const requestAppend = (times = 1) => {
+      if (appending || index >= groups.length) return;
+      appending = true;
+      setGridLoadHint(true, '加载中，继续下滑会自动加载');
+      requestAnimationFrame(() => {
+        appendChunk(times);
+        appending = false;
+        if (index >= groups.length) {
+          setGridLoadHint(false);
+        } else {
+          setGridLoadHint(false);
+        }
+      });
+    };
+
+    if (renderAllPlaceholders) {
+      const renderAll = () => {
+        if (index >= groups.length) {
+          setGridLoadHint(false);
+          return;
+        }
+        setGridLoadHint(true, 'Indexing placeholders...');
+        appendChunk(2);
+        requestAnimationFrame(renderAll);
+      };
+      requestAnimationFrame(renderAll);
+      return;
+    }
+
+    const pagerObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        requestAppend(platformInfo.isAndroid ? 2 : 1);
+        if (index >= groups.length) {
+          if (sentinel) {
+            pagerObserver.unobserve(sentinel);
+            sentinel.remove();
+            sentinel = null;
+          }
+        }
+      }
+    }, { rootMargin: '800px 0px' });
+
+    appendChunk(firstBurst);
+    if (index < groups.length) {
+      sentinel = document.createElement('div');
+      sentinel.className = 'grid-sentinel';
+      sentinel.textContent = '继续下滑加载更多';
+      el.grid.appendChild(sentinel);
+      pagerObserver.observe(sentinel);
+      setGridLoadHint(false);
+      if (gridScrollHandler) {
+        window.removeEventListener('scroll', gridScrollHandler);
+        gridScrollHandler = null;
+      }
+      gridScrollHandler = () => {
+        const root = document.scrollingElement || document.documentElement;
+        if (!root) return;
+        const remain = root.scrollHeight - root.scrollTop - root.clientHeight;
+        if (remain < (platformInfo.isAndroid ? 1400 : 1000)) {
+          requestAppend(platformInfo.isAndroid ? 2 : 1);
+        }
+      };
+      window.addEventListener('scroll', gridScrollHandler, { passive: true });
+    } else {
+      // all visible items were rendered in first burst
+      if (sentinel) {
+        sentinel.remove();
+        sentinel = null;
+      }
+      setGridLoadHint(false);
+      if (gridScrollHandler) {
+        window.removeEventListener('scroll', gridScrollHandler);
+        gridScrollHandler = null;
+      }
+    }
   }
 
   startScan = startScanOverride;

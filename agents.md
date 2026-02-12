@@ -171,4 +171,41 @@
   - `node --check src/js/app.js` 通过。
   - 在已打开页面可复现并验证“导航不再随机回首张”；后续重点回归“连续点击下一张直到末尾，按钮应稳定禁用”。
 
+## 本次对话摘要（2026-02-12，Android 大目录性能与体验）
+- 安卓文件选择策略落地：
+  - `folderBtn` 在 Android 统一改为“系统文件多选”路径（不再依赖目录模式），与实测最佳兼容方案一致。
+  - 新增选择器诊断日志 `[picker-debug] diagnose`，输出 `source/browser/inferredPicker/confidence`。
+  - 诊断改为采样（最多 400 文件）避免大批量选择时前置卡顿。
+- 扫描架构重构（大批量可先浏览再补全）：
+  - 由“全量扫描完成后再展示”改为“先索引+占位，再后台渐进识别 Live/EXIF”。
+  - `startScanOverride`：先构建 `state.items` 占位条目并立即 `renderGrid`，随后 `progressiveAnalyzeItems` 后台扫描。
+  - 扫描优先队列先处理首屏项（`priorityIds`），提升首屏可用性。
+- 网格渲染与滚动加载优化：
+  - 网格改为分批渲染（首屏 burst + 分页追加），并在 Android 扫描中支持“尽快补齐全部占位符”。
+  - 新增滚动预取与加载提示（`grid-sentinel` + `grid-load-hint`），快速下滑时显示“加载中，继续下滑会自动加载”。
+- 缩略图稳定性优化（减少反复重载）：
+  - 新增缩略图任务队列（Windows 并发=3，Android 并发=2）。
+  - 缩略图生成后写入 `item.thumbUrl` 持久复用，避免查看器开关/来回滚动时重复重建。
+  - 生成策略改为压缩小图（canvas + jpeg），降低内存与解码压力。
+- Live 识别修复与回归：
+  - 荣耀 Live 在大文件夹漏检问题修复：恢复稳定 EXIF 解析路径（含 `Make/Model` 识别链路）。
+  - 增加 `[live-detect] honor exif` 调试日志，便于确认 HONOR 命中来源。
+  - 若用户点开某项时后台尚未扫到，增加“按需即时识别”兜底，避免误判非 live。
+- Android Live 播放兼容补充（本轮延续）：
+  - 针对 `DEMUXER_ERROR_DETECTED_AAC` 增加去音轨回退（`stripMp4AudioTrack`），并缓存 `_audioStrippedBlob`。
+  - 重新播放时优先策略修正，避免每次重复触发同一 AAC 错误。
+- Indexing 体验持续优化（仍在迭代）：
+  - 提前显示 `scanOverlay`（`preShowScanOverlay`），并在扫描前用双帧让出保证首帧可见。
+  - 进度更新粒度调细（Android：索引 chunk 40、占位 chunk 80），避免一上来跳到较大值。
+  - 当前用户反馈：出现时机已提前但在超大选择场景仍可能偏晚（曾出现约 40 张后显示），该项仍为优先体验优化点。
+
+## 接手建议（下一位 AI）
+- 首先复核 `src/js/app.js` 中覆盖函数链：`startScanOverride`、`progressiveAnalyzeItems`、`renderGridOverride`、`loadThumbnailOverride`。
+- 若继续优化 Indexing 首帧：
+  - 进一步压缩 `handleSelectedFiles` 同步段（避免任何循环/日志在首帧前执行）。
+  - 必要时将 `preShowScanOverlay` 提前到 picker click 前（用户点击后立即显示“等待选择”）。
+- 若继续优化大目录稳定性：
+  - 引入卡片 DOM 复用（避免 `renderGrid` 全量清空重建）。
+  - 为 `thumbUrl` 增加 LRU 回收策略（超大目录长期滚动时控制内存峰值）。
+
 
