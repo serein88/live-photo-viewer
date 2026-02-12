@@ -147,4 +147,28 @@
    - 若 `video error` 且 `canPlay*` 为空，优先怀疑编码兼容（需转码样本验证）。
    - 若只有 `waiting/stalled`，优先排查资源读取/URL 生命周期问题。
 
+## 本次对话摘要（2026-02-11，Windows 导航稳定性）
+- 问题现象（用户反馈）：预览界面点击“下一张”会出现两类异常：
+  - 早期：未到最后一张时偶发跳回第一张。
+  - 修复后阶段：不再回第一张，但点几次“下一张”后会卡住不动。
+- 复现与定位（MCP 在已打开标签页直接调试）：
+  - `state.filtered.length = 14`，但 `viewer.index` 在中途卡住（例如 6），而外部索引还能继续增长。
+  - 根因是 Viewer 内部可导航列表依赖 `img[src]`，之前“按需加载 + 删除 src”导致内部长度被截断。
+- 已实施修复（`src/js/app.js`）：
+  1. 导航索引管控：
+     - 新增 `viewAtIndex()`，所有上一张/下一张都基于 `state.filtered` 计算目标索引。
+     - 接管 Viewer 原生 `Previous/Next` 按钮点击，避免直接依赖 `viewer.next()/prev()` 的内部状态。
+  2. 索引同步：
+     - 新增 `state.currentViewerIndex`，在 `openViewer`、`viewed`、`viewAtIndex` 中同步更新。
+     - 侧边按钮与禁用状态判定改为优先使用 `currentViewerIndex`。
+  3. Viewer 列表长度稳定：
+     - 新增 `VIEWER_PLACEHOLDER_SRC`（1x1 占位图），保证 `viewerGallery` 所有项始终有 `src`。
+     - 内存回收时不再删除 `src`，而是恢复占位图；窗口内按需替换为真实 `blob:`。
+- 关联修复（同轮）：
+  - 修复多处历史乱码字符串导致的 `app.js` 语法中断（此前会造成按钮“无反应”假象）。
+  - 针对 `test/荣耀-live-1.jpg` 增强识别：无 XMP 时增加中段 MP4 (`ftyp`) 探测与提取兜底。
+- 验证状态：
+  - `node --check src/js/app.js` 通过。
+  - 在已打开页面可复现并验证“导航不再随机回首张”；后续重点回归“连续点击下一张直到末尾，按钮应稳定禁用”。
+
 

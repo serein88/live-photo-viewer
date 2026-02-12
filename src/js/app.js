@@ -1610,12 +1610,38 @@ function findMp4FtypOffset(buf) {
   return -1;
 }
 
+async function readBytesAt(file, offset, size) {
+  if (offset < 0 || offset >= file.size) return null;
+  const slice = file.slice(offset, Math.min(offset + size, file.size));
+  return slice.arrayBuffer();
+}
+
+function isFtypHeader(buf) {
+  if (!buf || buf.byteLength < 12) return false;
+  const bytes = new Uint8Array(buf);
+  return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
+}
+
 async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
   const minBytes = 200 * 1024;
+  if (Number.isFinite(preferredOffset) && preferredOffset > 0) {
+    const candidates = [];
+    const fromStart = preferredOffset;
+    const fromEnd = file.size - preferredOffset;
+    if (fromStart > 0 && fromStart < file.size - 12) candidates.push(fromStart);
+    if (fromEnd > 0 && fromEnd < file.size - 12) candidates.push(fromEnd);
+    for (const offset of candidates) {
+      const head = await readBytesAt(file, offset, 16);
+      if (!isFtypHeader(head)) continue;
+      if (file.size - offset < minBytes) continue;
+      const tail = await file.slice(offset).arrayBuffer();
+      return new Blob([tail], { type: 'video/mp4' });
+    }
+  }
   const probeSizes = [1024 * 1024, 4 * 1024 * 1024];
   for (const size of probeSizes) {
     const probe = await readHeadBytes(file, Math.min(size, file.size));
-    let offset = Number.isFinite(preferredOffset) && preferredOffset > 0 ? preferredOffset : findMp4FtypOffset(probe);
+    let offset = findMp4FtypOffset(probe);
     if (offset < 0) continue;
     if (offset + 12 > probe.byteLength) {
       const bigger = await readHeadBytes(file, Math.min(file.size, Math.max(size * 2, offset + 32)));
@@ -1624,6 +1650,7 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
     }
     if (file.size - offset < minBytes) continue;
     const tail = await file.slice(offset).arrayBuffer();
+    if (isFtypHeader(tail)) return new Blob([tail], { type: 'video/mp4' });
     const blob = extractEmbeddedVideo(tail, 0);
     if (blob) return blob;
   }
