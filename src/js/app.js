@@ -1659,6 +1659,23 @@ function isFtypHeader(buf) {
   return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
 }
 
+async function readTailText(file, size) {
+  const { buffer } = await readTailBytes(file, size);
+  return new TextDecoder('latin1').decode(new Uint8Array(buffer));
+}
+
+async function parseMicroOffsetFromTail(file) {
+  try {
+    const text = await readTailText(file, 512 * 1024);
+    const match = text.match(/MicroVideoOffset[^0-9]*(\\d+)/i);
+    if (!match) return null;
+    const num = Number(match[1]);
+    return Number.isFinite(num) ? num : null;
+  } catch {
+    return null;
+  }
+}
+
 async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
   const minBytes = 200 * 1024;
   if (Number.isFinite(preferredOffset) && preferredOffset > 0) {
@@ -1791,6 +1808,10 @@ function analyzeFile(file, byBase) {
       const makeText = String(exif?.Make || '').toLowerCase();
       const modelText = String(exif?.Model || '').toLowerCase();
       if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) vendorType = 'HONOR Live Photo';
+
+      if (microOffset == null) {
+        microOffset = await parseMicroOffsetFromTail(file);
+      }
 
       let videoBlob = null;
       const needsDeepScan = shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
