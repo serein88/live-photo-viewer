@@ -18,6 +18,8 @@
 const EXIF_SLICE_SIZE = 256 * 1024;
 let renderTimer = null;
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
+const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
+const VIDEO_EXTS = new Set(['mp4','mov','m4v','3gp','webm','mkv','avi']);
 
 const el = {
   filePicker: document.getElementById('filePicker'),
@@ -107,6 +109,25 @@ function setStatus(text) { el.status.textContent = text; }
 function setFilter(f) {
   state.filter = f;
   renderGrid();
+}
+
+function getFileExt(name) {
+  if (!name) return '';
+  const idx = name.lastIndexOf('.');
+  if (idx < 0) return '';
+  return name.slice(idx + 1).toLowerCase();
+}
+
+function isImageFile(file) {
+  if (file?.type && file.type.startsWith('image/')) return true;
+  const ext = getFileExt(file?.name || '');
+  return IMAGE_EXTS.has(ext);
+}
+
+function isVideoFile(file) {
+  if (file?.type && file.type.startsWith('video/')) return true;
+  const ext = getFileExt(file?.name || '');
+  return VIDEO_EXTS.has(ext);
 }
 
 async function handleSelectedFiles(files, source) {
@@ -1686,7 +1707,7 @@ async function scanFiles(files) {
     byBase.get(base).push(f);
   }
 
-  const queue = files.filter(f => f.type.startsWith('image/'));
+  const queue = files.filter(isImageFile);
   const concurrency = 4;
   for (let start = 0; start < queue.length; start += concurrency) {
     const chunk = queue.slice(start, start + concurrency);
@@ -1842,7 +1863,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
       byBase.get(base).push(f);
     }
 
-    const queue = files.filter(f => f.type.startsWith('image/'));
+    const queue = files.filter(isImageFile);
     const total = queue.length;
     const concurrency = getScanConcurrency();
     const yieldEvery = platformInfo.isAndroid ? 8 : 24;
