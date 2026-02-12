@@ -1641,6 +1641,77 @@ function findLastMp4FtypOffset(buf) {
   return -1;
 }
 
+function readU32BE(bytes, offset) {
+  return (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+}
+
+function readU64BE(bytes, offset) {
+  if (offset + 8 > bytes.length) return null;
+  const hi = readU32BE(bytes, offset);
+  const lo = readU32BE(bytes, offset + 4);
+  if (hi > 0x1fffff) return null;
+  return hi * 2 ** 32 + lo;
+}
+
+function readBoxType(bytes, offset) {
+  return String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+}
+
+function readBoxSize(bytes, offset) {
+  let size = readU32BE(bytes, offset);
+  if (size === 1) {
+    const big = readU64BE(bytes, offset + 8);
+    return big == null ? null : big;
+  }
+  if (size === 0) return bytes.length - offset;
+  return size;
+}
+
+function findBoxOffset(bytes, type, start = 0, end = null) {
+  const max = end == null ? bytes.length - 8 : Math.min(end, bytes.length - 8);
+  for (let i = Math.max(0, start); i <= max; i++) {
+    if (bytes[i + 4] === type[0] && bytes[i + 5] === type[1] && bytes[i + 6] === type[2] && bytes[i + 7] === type[3]) {
+      const size = readBoxSize(bytes, i);
+      if (size != null && size >= 8 && i + size <= bytes.length) return i;
+    }
+  }
+  return -1;
+}
+
+function validateMp4At(bytes, offset) {
+  if (offset < 0 || offset + 12 > bytes.length) return { valid: false };
+  if (bytes[offset + 4] !== 0x66 || bytes[offset + 5] !== 0x74 || bytes[offset + 6] !== 0x79 || bytes[offset + 7] !== 0x70) {
+    return { valid: false };
+  }
+  let pos = offset;
+  let sawFtyp = false;
+  let sawMoov = false;
+  let sawMdat = false;
+  for (let i = 0; i < 64 && pos + 8 <= bytes.length; i++) {
+    const size = readBoxSize(bytes, pos);
+    if (size == null || size < 8) return { valid: false };
+    if (pos + size > bytes.length) return { valid: false };
+    const type = readBoxType(bytes, pos);
+    if (type === 'ftyp') sawFtyp = true;
+    if (type === 'moov') sawMoov = true;
+    if (type === 'mdat') sawMdat = true;
+    pos += size;
+    if (sawFtyp && sawMoov) return { valid: true, sawMdat };
+  }
+  return { valid: sawFtyp && sawMoov, sawMdat };
+}
+
+function findValidMp4Offset(buf) {
+  const bytes = new Uint8Array(buf);
+  const max = bytes.length - 12;
+  for (let i = 0; i <= max; i++) {
+    if (bytes[i + 4] !== 0x66 || bytes[i + 5] !== 0x74 || bytes[i + 6] !== 0x79 || bytes[i + 7] !== 0x70) continue;
+    const result = validateMp4At(bytes, i);
+    if (result.valid) return i;
+  }
+  return -1;
+}
+
 async function readBytesAt(file, offset, size) {
   if (offset < 0 || offset >= file.size) return null;
   const slice = file.slice(offset, Math.min(offset + size, file.size));
@@ -1659,12 +1730,18 @@ function isFtypHeader(buf) {
   return bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70;
 }
 
+function readFtypBrand(buf) {
+  if (!buf || buf.byteLength < 12) return '(unknown)';
+  const bytes = new Uint8Array(buf);
+  return String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+}
+
 async function findFtypAround(file, center, windowSize = 512 * 1024) {
   const half = Math.floor(windowSize / 2);
   const start = Math.max(0, center - half);
   const buf = await readBytesAt(file, start, windowSize);
   if (!buf) return -1;
-  const rel = findMp4FtypOffset(buf);
+  const rel = findValidMp4Offset(buf);
   if (rel < 0) return -1;
   return start + rel;
 }
@@ -1696,26 +1773,32 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
     if (fromEnd > 0 && fromEnd < file.size - 12) candidates.push(fromEnd);
     for (const offset of candidates) {
       let chosen = -1;
-      const head = await readBytesAt(file, offset, 16);
-      if (isFtypHeader(head)) {
-        chosen = offset;
-      } else {
-        const around = await findFtypAround(file, offset, 512 * 1024);
-        if (around >= 0) chosen = around;
+      const windowSize = Math.min(file.size, 4 * 1024 * 1024);
+      const start = Math.max(0, offset - Math.floor(windowSize / 2));
+      const aroundBuf = await readBytesAt(file, start, windowSize);
+      if (aroundBuf) {
+        const rel = findValidMp4Offset(aroundBuf);
+        if (rel >= 0) chosen = start + rel;
+      }
+      if (chosen < 0) {
+        const head = await readBytesAt(file, offset, 16);
+        if (isFtypHeader(head)) chosen = offset;
       }
       if (chosen < 0) continue;
       if (file.size - chosen < minBytes) continue;
       const tail = await file.slice(chosen).arrayBuffer();
       if (platformInfo.isAndroid) {
+        const brand = readFtypBrand(await readBytesAt(file, chosen, 16));
         console.debug('[live-debug] extract offset', { method: 'microOffset', offset: chosen, fileSize: file.size });
+        console.debug('[live-debug] mp4 brand', { method: 'microOffset', brand });
       }
       return new Blob([tail], { type: 'video/mp4' });
     }
   }
   // Prefer ftyp in tail (common for embedded video at end of JPEG).
-  const tailSize = Math.min(file.size, 8 * 1024 * 1024);
+  const tailSize = Math.min(file.size, 16 * 1024 * 1024);
   const tailProbe = await readTailBytes(file, tailSize);
-  const tailRel = findLastMp4FtypOffset(tailProbe.buffer);
+  const tailRel = findValidMp4Offset(tailProbe.buffer);
   if (tailRel >= 0) {
     const offset = tailProbe.start + tailRel;
     if (file.size - offset >= minBytes) {
@@ -1723,7 +1806,9 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
       if (isFtypHeader(head)) {
         const tail = await file.slice(offset).arrayBuffer();
         if (platformInfo.isAndroid) {
+          const brand = readFtypBrand(head);
           console.debug('[live-debug] extract offset', { method: 'tail-ftyp', offset, fileSize: file.size });
+          console.debug('[live-debug] mp4 brand', { method: 'tail-ftyp', brand });
         }
         return new Blob([tail], { type: 'video/mp4' });
       }
@@ -1732,11 +1817,11 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
   const probeSizes = [1024 * 1024, 4 * 1024 * 1024];
   for (const size of probeSizes) {
     const probe = await readHeadBytes(file, Math.min(size, file.size));
-    let offset = findMp4FtypOffset(probe);
+    let offset = findValidMp4Offset(probe);
     if (offset < 0) continue;
     if (offset + 12 > probe.byteLength) {
       const bigger = await readHeadBytes(file, Math.min(file.size, Math.max(size * 2, offset + 32)));
-      offset = findMp4FtypOffset(bigger);
+      offset = findValidMp4Offset(bigger);
       if (offset < 0) continue;
     }
     if (file.size - offset < minBytes) continue;
