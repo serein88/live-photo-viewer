@@ -40,3 +40,7 @@
 - （1）via + 厂商定制文件选择器：支持多选/滑选，vivo 实测上限约 100 张。
 - （2）Edge/Chrome + 安卓系统文件夹选择器：兼容性差，vivo 可能无音频，荣耀/小米可能无法播放。
 - （3）Edge/Chrome + 安卓系统文件多选（非文件夹）：可选数量更高，且 Live 播放稳定。此方案确定为安卓端默认策略。
+
+- 安卓端快捷调试
+cd E:\CodeSpace\live-photo-viewer
+python -m http.server 8080
