@@ -1701,6 +1701,29 @@ function validateMp4At(bytes, offset) {
   return { valid: sawFtyp && sawMoov, sawMdat };
 }
 
+function trimMp4Buffer(buf) {
+  if (!buf || buf.byteLength < 16) return buf;
+  const bytes = new Uint8Array(buf);
+  if (readBoxType(bytes, 0) !== 'ftyp') return buf;
+  let pos = 0;
+  let sawMoov = false;
+  let sawMdat = false;
+  for (let i = 0; i < 512 && pos + 8 <= bytes.length; i++) {
+    const size = readBoxSize(bytes, pos);
+    if (size == null || size < 8) break;
+    if (pos + size > bytes.length) break;
+    const type = readBoxType(bytes, pos);
+    if (type === 'moov') sawMoov = true;
+    if (type === 'mdat') sawMdat = true;
+    pos += size;
+    if (pos === bytes.length) break;
+  }
+  if (pos > 0 && pos <= bytes.length && (sawMoov || sawMdat) && pos >= 1024) {
+    return buf.slice(0, pos);
+  }
+  return buf;
+}
+
 function findValidMp4Offset(buf) {
   const bytes = new Uint8Array(buf);
   const max = bytes.length - 12;
@@ -1787,12 +1810,16 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
       if (chosen < 0) continue;
       if (file.size - chosen < minBytes) continue;
       const tail = await file.slice(chosen).arrayBuffer();
+      const trimmed = trimMp4Buffer(tail);
       if (platformInfo.isAndroid) {
         const brand = readFtypBrand(await readBytesAt(file, chosen, 16));
         console.debug('[live-debug] extract offset', { method: 'microOffset', offset: chosen, fileSize: file.size });
         console.debug('[live-debug] mp4 brand', { method: 'microOffset', brand });
+        if (trimmed.byteLength !== tail.byteLength) {
+          console.debug('[live-debug] mp4 trim', { method: 'microOffset', original: tail.byteLength, trimmed: trimmed.byteLength });
+        }
       }
-      return new Blob([tail], { type: 'video/mp4' });
+      return new Blob([trimmed], { type: 'video/mp4' });
     }
   }
   // Prefer ftyp in tail (common for embedded video at end of JPEG).
@@ -1805,12 +1832,16 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
       const head = await readBytesAt(file, offset, 16);
       if (isFtypHeader(head)) {
         const tail = await file.slice(offset).arrayBuffer();
+        const trimmed = trimMp4Buffer(tail);
         if (platformInfo.isAndroid) {
           const brand = readFtypBrand(head);
           console.debug('[live-debug] extract offset', { method: 'tail-ftyp', offset, fileSize: file.size });
           console.debug('[live-debug] mp4 brand', { method: 'tail-ftyp', brand });
+          if (trimmed.byteLength !== tail.byteLength) {
+            console.debug('[live-debug] mp4 trim', { method: 'tail-ftyp', original: tail.byteLength, trimmed: trimmed.byteLength });
+          }
         }
-        return new Blob([tail], { type: 'video/mp4' });
+        return new Blob([trimmed], { type: 'video/mp4' });
       }
     }
   }
@@ -1826,7 +1857,10 @@ async function extractEmbeddedVideoFromFile(file, preferredOffset = null) {
     }
     if (file.size - offset < minBytes) continue;
     const tail = await file.slice(offset).arrayBuffer();
-    if (isFtypHeader(tail)) return new Blob([tail], { type: 'video/mp4' });
+    if (isFtypHeader(tail)) {
+      const trimmed = trimMp4Buffer(tail);
+      return new Blob([trimmed], { type: 'video/mp4' });
+    }
     const blob = extractEmbeddedVideo(tail, 0);
     if (blob) return blob;
   }
