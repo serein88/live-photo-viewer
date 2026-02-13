@@ -1,18 +1,31 @@
-﻿# Live 图查看器
+﻿# Live Photo Viewer
 
-## 运行方式
-- 这是纯前端静态项目。
-- 使用任意静态服务器打开项目根目录并访问 `index.html`。
+## Run
+- Static frontend project, no backend required.
+- Start any static server in project root, then open `index.html`.
 
-## 目录
-- `index.html`: 页面入口
-- `src/css/app.css`: 业务样式
-- `src/js/app.js`: 业务逻辑
-- `vendor/`: 第三方库（Viewer.js）
-- `docs/`: 项目管理文档
-- `agents.md`: 开发交接日志
+## Standardized Agent Files
+- `task.json`: single source of truth for task queue and status.
+- `progress.txt`: append-only execution log for handoff.
+- `claude.md`: fixed six-step workflow prompt (Codex/Claude compatible).
+- `scripts/init-dev.ps1`: session bootstrap script (prints next pending task).
 
-## 协作约定
-- 功能开发先更新文档，再改代码。
-- 每次需求完成后更新 `agents.md`。
-- 大改动优先拆分为多次小提交。
+## Structure
+- `index.html`: app entry
+- `src/css/app.css`: app styles
+- `src/js/app.js`: app logic
+- `vendor/`: third-party libs (Viewer.js)
+- `todo.md`: human-readable backlog snapshot
+- `agents.md`: legacy entrypoint (redirects to structured docs)
+- `开发文档.md`: architecture and engineering constraints
+- `docs/`: workflow and session templates
+
+## Quick Start for Each Session
+1. `powershell -ExecutionPolicy Bypass -File scripts/init-dev.ps1`
+2. Pick first `pending` task in `task.json` and set to `in_progress`
+3. Implement + verify
+4. Write result to `progress.txt`
+5. Update `task.json` status and append `progress.txt`
+6. Commit with task id in message
+
+

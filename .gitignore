@@ -1,5 +1,9 @@
-mcp-bundle.json
-/build
+﻿/build
 /test
 /docs
+开发文档.md
+agents.md
+claude.md
+progress.txt
+task.json
 todo.md
