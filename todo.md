@@ -44,3 +44,4 @@
 - 安卓端快捷调试
 cd E:\CodeSpace\live-photo-viewer
 python -m http.server 8080
+
