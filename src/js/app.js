@@ -73,6 +73,7 @@ function detectPlatform() {
 }
 
 const platformInfo = detectPlatform();
+const browserHint = getBrowserHint();
 const supportsDirectoryPicker = 'showDirectoryPicker' in window;
 const supportsWebkitDir = 'webkitdirectory' in el.dirPicker;
 const supportsFolder = supportsDirectoryPicker || supportsWebkitDir;
@@ -106,7 +107,7 @@ function updateStats() {
   const total = state.items.length;
   const live = state.items.filter(i => i.isLive).length;
   const selected = state.selection.size;
-  el.stats.textContent = `鎬昏 ${total} 路 Live ${live} 路 宸查€?${selected}`;
+  el.stats.textContent = `总计 ${total} · Live ${live} · 已选 ${selected}`;
   el.exportBtn.disabled = selected === 0;
 }
 
@@ -166,6 +167,35 @@ function getBrowserHint() {
   if (/MQQBrowser/i.test(ua)) return 'qqbrowser';
   if (/UCBrowser/i.test(ua)) return 'uc';
   return 'unknown';
+}
+
+function isAndroidEdgeBrowser() {
+  return !!(platformInfo?.isAndroid && browserHint === 'edge-android');
+}
+
+function revokeVideoObjectUrl(video) {
+  const current = video?._objectUrl || '';
+  if (current) {
+    try { URL.revokeObjectURL(current); } catch {}
+  }
+  if (video) video._objectUrl = '';
+}
+
+function resetVideoElementSource(video) {
+  if (!video) return;
+  try { video.pause(); } catch {}
+  revokeVideoObjectUrl(video);
+  video.removeAttribute('src');
+  try { video.load(); } catch {}
+}
+
+function setVideoBlobSource(video, blob) {
+  if (!video || !blob) return '';
+  resetVideoElementSource(video);
+  const url = URL.createObjectURL(blob);
+  video._objectUrl = url;
+  video.src = url;
+  return url;
 }
 
 function diagnosePickerSource(files, source) {
@@ -296,7 +326,7 @@ async function loadBundle(file) {
 async function startScan() {
   if (!state.files.length || state.scanning) return;
   state.scanning = true;
-  setStatus('鎵弿涓?..');
+  setStatus('扫描中...');
   if (state.items.length) {
     state.items.forEach((item) => {
       if (item.objectUrl) {
@@ -313,7 +343,7 @@ async function startScan() {
   renderGrid();
   updateStats();
   state.scanning = false;
-  setStatus('鎵弿瀹屾垚');
+  setStatus('扫描完成');
 }
 
 document.getElementById('filterAll').onclick = () => setFilter('all');
@@ -374,7 +404,7 @@ async function pickDirectoryByPlatform() {
   const env = platformInfo;
   console.debug('[dir-pick] platform', env);
   if (env.isIOS) {
-    setStatus('iOS 涓嶆敮鎸佺洰褰曢€夋嫨锛屽凡鍒囨崲涓哄鏂囦欢閫夋嫨');
+    setStatus('iOS 不支持文件夹选择，已切换为多文件选择');
     openFilePickerFallback();
     return null;
   }
@@ -413,7 +443,7 @@ el.folderBtn.addEventListener('click', async () => {
     preHideScanOverlay();
     return;
   } else if (!platformInfo.isIOS) {
-    setStatus('宸插彇娑堟枃浠跺す閫夋嫨');
+    setStatus('已取消文件夹选择');
     preHideScanOverlay();
   }
 });
@@ -429,7 +459,7 @@ el.exportBtn.addEventListener('click', async () => {
   setStatus('Export complete');
 });
 
-// MCP 璋冭瘯鍏ュ彛锛氫笉鍦?UI 鏆撮湶锛屼緵鑷姩鍖栬皟鐢?
+// MCP 调试入口：不在 UI 暴露，仅供自动化调试调用
 window.__mcpImportDir = () => {
   if (el.mcpFiles) {
     el.mcpFiles.click();
@@ -911,12 +941,12 @@ function ensureViewerTopbar() {
     bar.className = 'viewer-topbar';
     bar.innerHTML = `
       <div class="topbar-left">
-        <button class="topbar-btn back" title="杩斿洖" aria-label="杩斿洖"></button>
-        <div class="topbar-title">棰勮</div>
+        <button class="topbar-btn back" title="返回" aria-label="返回"></button>
+        <div class="topbar-title">预览</div>
       </div>
       <div class="topbar-right">
         <div class="topbar-live-slot"></div>
-        <button class="topbar-btn info" title="淇℃伅" aria-label="淇℃伅"></button>
+        <button class="topbar-btn info" title="信息" aria-label="信息"></button>
       </div>
     `;
     container.appendChild(bar);
@@ -943,7 +973,7 @@ function updateViewerTopbar() {
   if (!bar) return;
   const title = bar.querySelector('.topbar-title');
   const current = state.filtered[viewer.index];
-  title.textContent = current ? current.name : '棰勮';
+  title.textContent = current ? current.name : '预览';
   const panel = document.querySelector('.viewer-panel');
   syncPanelState(!!(panel && !panel.classList.contains('hidden')));
   const container = getViewerContainer();
@@ -966,11 +996,11 @@ function ensureViewerPanel() {
     panel.className = 'viewer-panel hidden';
     panel.innerHTML = `
       <div class="panel-header">
-        <span>淇℃伅</span>
-        <button class="topbar-btn close" title="鍏抽棴" aria-label="鍏抽棴"></button>
+        <span>信息</span>
+        <button class="topbar-btn close" title="关闭" aria-label="关闭"></button>
       </div>
       <div class="panel-body">
-        <div class="panel-hint">娣诲姞璇存槑</div>
+        <div class="panel-hint">添加说明</div>
         <div class="panel-grid"></div>
       </div>
     `;
@@ -1263,7 +1293,7 @@ function updateLiveButton() {
   if (!btn) {
     btn = document.createElement('button');
     btn.className = 'viewer-live-btn';
-    btn.title = '鎾斁 Live';
+    btn.title = '播放 Live';
     btn.addEventListener('click', () => {
       const item = state.filtered[viewer.index];
       if (!item || !item.videoBlob) return;
@@ -1290,10 +1320,17 @@ function updateLiveButton() {
   if (!muteBtn) {
     muteBtn = document.createElement('button');
     muteBtn.className = 'viewer-mute-btn';
-    muteBtn.title = '闈欓煶/鍙栨秷闈欓煶';
+    muteBtn.title = '静音/取消静音';
     muteBtn.dataset.muted = String(state.liveMuted);
     muteBtn.addEventListener('click', () => {
-      state.liveMuted = !state.liveMuted;
+      const currentItem = state.viewer ? state.filtered[state.viewer.index] : null;
+      const nextMuted = !state.liveMuted;
+      if (!nextMuted && isAndroidEdgeBrowser() && currentItem?._edgeForceStripped) {
+        // User explicitly retries audio on a previously degraded item.
+        currentItem._edgeForceStripped = false;
+        setStatus('Android Edge 正在重试音频播放');
+      }
+      state.liveMuted = nextMuted;
       muteBtn.dataset.muted = String(state.liveMuted);
       const layer = document.querySelector('.viewer-live-video');
       const video = layer?.querySelector('video');
@@ -1304,7 +1341,7 @@ function updateLiveButton() {
       // On Android, when user explicitly unmutes, re-open using original blob first.
       if (!state.liveMuted && platformInfo?.isAndroid && state.viewer) {
         const item = state.filtered[state.viewer.index];
-        if (item?.isLive && item.videoBlob && item._audioStrippedBlob && layer?.classList.contains('active')) {
+        if (item?.isLive && item.videoBlob && layer?.classList.contains('active')) {
           openLiveVideoInline(item);
         }
       }
@@ -1318,43 +1355,116 @@ function updateLiveButton() {
     btn.classList.add('active');
     btn.classList.remove('hidden');
     muteBtn.classList.remove('hidden');
+    const edgeAudioBlocked = isAndroidEdgeBrowser() && !!current._edgeForceStripped;
+    muteBtn.dataset.edgeAudioBlocked = edgeAudioBlocked ? 'true' : 'false';
+    muteBtn.title = edgeAudioBlocked ? '当前文件在 Android Edge 无法播放音频' : '静音/取消静音';
   } else {
     btn.classList.remove('active');
     btn.classList.add('hidden');
     muteBtn.classList.add('hidden');
+    muteBtn.dataset.edgeAudioBlocked = 'false';
+    muteBtn.title = '静音/取消静音';
   }
   syncLiveButtonState();
   console.debug('[viewer] live buttons', { index: viewer.index, live: !!(current && current.isLive && current.videoBlob) });
 }
 
-function openLiveVideoInline(item) {
+async function openLiveVideoInline(item) {
   const layer = ensureLiveVideoLayer();
   if (!layer) return;
   const video = layer.querySelector('video');
   if (!video) return;
+  const playbackToken = Number(video._playbackToken || 0) + 1;
+  video._playbackToken = playbackToken;
+  const isCurrentPlayback = () => Number(video._playbackToken || 0) === playbackToken;
+  // Do not permanently lock a file to stripped mode across play sessions.
+  // Re-probe original source each new play, then fallback again if Edge fails.
+  if (isAndroidEdgeBrowser() && !state.livePlaying && item._edgeForceStripped) {
+    item._edgeForceStripped = false;
+  }
   const previewImage = state.viewer?.image || null;
-  if (video.src) URL.revokeObjectURL(video.src);
-  const preferOriginalAudio = !!(platformInfo?.isAndroid && !state.liveMuted);
-  const blobToPlay = preferOriginalAudio ? item.videoBlob : (item._audioStrippedBlob || item.videoBlob);
+  const edgeForceStripped = isAndroidEdgeBrowser() && !!item._edgeForceStripped;
+  const forceOriginalForEdge = isAndroidEdgeBrowser() && !edgeForceStripped;
+  const preferOriginalAudio = !!(platformInfo?.isAndroid && !state.liveMuted && !edgeForceStripped);
+  const blobToPlay = forceOriginalForEdge
+    ? item.videoBlob
+    : (preferOriginalAudio ? item.videoBlob : (item._audioStrippedBlob || item.videoBlob));
   const sourceMode = blobToPlay === item.videoBlob ? 'original' : 'stripped';
-  const videoUrl = URL.createObjectURL(blobToPlay);
+  const effectiveMuted = edgeForceStripped ? true : state.liveMuted;
   video.playsInline = true;
   video.preload = 'auto';
   video.controls = false;
-  video.src = videoUrl;
+  setVideoBlobSource(video, blobToPlay);
   video.currentTime = 0;
-  video.muted = state.liveMuted;
-  video.volume = state.liveMuted ? 0 : 1;
+  video.defaultMuted = effectiveMuted;
+  video.muted = effectiveMuted;
+  video.volume = effectiveMuted ? 0 : 1;
   console.debug('[live-debug] open', {
     name: item.name,
     blobType: blobToPlay?.type || '(empty)',
     blobSize: blobToPlay?.size || 0,
     sourceMode,
-    muted: video.muted,
+    muted: effectiveMuted,
+    edgeForceStripped,
     isAndroid: !!platformInfo?.isAndroid,
     canPlayMp4: video.canPlayType('video/mp4'),
     canPlayQuickTime: video.canPlayType('video/quicktime')
   });
+  let fallbackPromise = null;
+  const fallbackToStripped = async (reason) => {
+    if (!isCurrentPlayback()) return false;
+    if (fallbackPromise) return fallbackPromise;
+    fallbackPromise = (async () => {
+      if (!isCurrentPlayback()) return false;
+    let stripped = item._audioStrippedBlob || null;
+    if (!stripped) {
+      stripped = await stripMp4AudioTrack(item.videoBlob);
+      if (stripped) {
+        console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
+        item._audioStrippedBlob = stripped;
+      } else {
+        console.debug('[live-debug] strip audio skipped', { name: item.name, reason });
+      }
+    } else {
+      console.debug('[live-debug] use cached stripped', { name: item.name, reason, sourceMode });
+    }
+    if (!isCurrentPlayback() || !stripped || blobToPlay === stripped) return false;
+    if (isAndroidEdgeBrowser()) {
+      item._edgeForceStripped = true;
+      state.liveMuted = true;
+      const muteBtn = document.querySelector('.viewer-mute-btn');
+      if (muteBtn) {
+        muteBtn.dataset.muted = 'true';
+        muteBtn.title = '当前文件在 Android Edge 无法播放音频';
+      }
+      setStatus('Android Edge 检测到媒体解码不兼容，已自动切换静音播放');
+    }
+    if (!isCurrentPlayback()) return false;
+    setVideoBlobSource(video, stripped);
+    video.currentTime = 0;
+    video.defaultMuted = true;
+    video.muted = true;
+    video.volume = 0;
+    try {
+      await video.play();
+      if (!isCurrentPlayback()) return false;
+      if (state.viewer) updateLiveButton();
+      return true;
+    } catch (retryErr) {
+      console.debug('[live-debug] strip retry reject', {
+        name: item.name,
+        reason,
+        message: retryErr?.message || String(retryErr)
+      });
+      return false;
+    }
+    })();
+    try {
+      return await fallbackPromise;
+    } finally {
+      fallbackPromise = null;
+    }
+  };
   if (platformInfo?.isAndroid) {
     detectMp4Tracks(blobToPlay).then((info) => {
       console.debug('[live-debug] mp4 tracks', {
@@ -1388,6 +1498,7 @@ function openLiveVideoInline(item) {
     console.debug('[live-debug] stalled', { name: item.name, t: video.currentTime });
   };
   video.onerror = async () => {
+    if (!isCurrentPlayback()) return;
     const mediaError = video.error;
     console.debug('[live-debug] video error', {
       name: item.name,
@@ -1395,32 +1506,13 @@ function openLiveVideoInline(item) {
       message: mediaError?.message || '(no-message)'
     });
     const message = mediaError?.message || '';
-    if (platformInfo?.isAndroid && /AAC|DEMUXER_ERROR/i.test(message)) {
-      let stripped = item._audioStrippedBlob || null;
-      if (!stripped) {
-        stripped = await stripMp4AudioTrack(item.videoBlob);
-        if (stripped) {
-          console.debug('[live-debug] strip audio retry', { name: item.name, before: item.videoBlob.size, after: stripped.size });
-          item._audioStrippedBlob = stripped;
-        } else {
-          console.debug('[live-debug] strip audio skipped', { name: item.name });
-        }
-      } else {
-        console.debug('[live-debug] use cached stripped', { name: item.name, sourceMode });
-      }
-      if (stripped && blobToPlay !== stripped) {
-        if (video.src) URL.revokeObjectURL(video.src);
-        video.src = URL.createObjectURL(stripped);
-        video.currentTime = 0;
-        video.play().catch((retryErr) => {
-          console.debug('[live-debug] strip retry reject', {
-            name: item.name,
-            message: retryErr?.message || String(retryErr)
-          });
-        });
-        return;
-      }
+    const shouldFallbackToStripped = !!(platformInfo?.isAndroid
+      && (isAndroidEdgeBrowser() || /AAC|DEMUXER_ERROR/i.test(message)));
+    if (shouldFallbackToStripped) {
+      const ok = await fallbackToStripped('video-error');
+      if (ok) return;
     }
+    if (!isCurrentPlayback()) return;
     if (previewImage) {
       previewImage.style.opacity = '';
     }
@@ -1450,21 +1542,24 @@ function openLiveVideoInline(item) {
   };
   console.debug('[viewer] live play', { name: item.name });
   video.play().catch((err) => {
+    if (!isCurrentPlayback()) return;
     console.debug('[live-debug] play reject', {
       name: item.name,
       message: err?.message || String(err),
       isAndroid: !!platformInfo?.isAndroid
     });
     if (platformInfo?.isAndroid) {
-      video.muted = true;
-      state.liveMuted = true;
-      const muteBtn = document.querySelector('.viewer-mute-btn');
-      if (muteBtn) muteBtn.dataset.muted = 'true';
-      video.controls = true;
-      video.play().catch((retryErr) => {
-        console.debug('[live-debug] retry reject', {
-          name: item.name,
-          message: retryErr?.message || String(retryErr)
+      fallbackToStripped('play-reject').then((ok) => {
+        if (!isCurrentPlayback()) return;
+        if (ok) return;
+        video.muted = true;
+        video.defaultMuted = true;
+        video.controls = true;
+        video.play().catch((retryErr) => {
+          console.debug('[live-debug] retry reject', {
+            name: item.name,
+            message: retryErr?.message || String(retryErr)
+          });
         });
       });
     }
@@ -1477,6 +1572,7 @@ function closeLiveVideoInline() {
   const video = layer.querySelector('video');
   layer.classList.remove('active');
   if (video) {
+    video._playbackToken = Number(video._playbackToken || 0) + 1;
     video.pause();
     video.onended = null;
     video.onplay = null;
@@ -1486,8 +1582,7 @@ function closeLiveVideoInline() {
     video.onstalled = null;
     video.onerror = null;
     video.controls = false;
-    if (video.src) URL.revokeObjectURL(video.src);
-    video.removeAttribute('src');
+    resetVideoElementSource(video);
   }
   if (state.viewer && state.viewer.image) {
     state.viewer.image.style.opacity = '';
@@ -2971,4 +3066,5 @@ function readTagValue(view, type, count, valueOffset, little, base) {
   renderGrid = renderGridOverride;
   loadThumbnail = loadThumbnailOverride;
 })();
+
 
