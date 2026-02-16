@@ -17,6 +17,16 @@
   scanByBase: null,
 };
 const EXIF_SLICE_SIZE = 256 * 1024;
+const EXIFR_PARSE_OPTIONS_BASE = Object.freeze({
+  tiff: true,
+  ifd0: true,
+  exif: true,
+  gps: true,
+  ifd1: false,
+  interop: false,
+  makerNote: false,
+  userComment: false,
+});
 let renderTimer = null;
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
@@ -636,7 +646,8 @@ function ensureExifTimes() {
     if (item.exifTime == null && !item.exifChecked) {
       try {
         const buf = await readExifBuffer(item.file);
-        const exif = extractExif(buf);
+        const meta = await parseImageMetadata(item.file, { needXmp: false, headBuffer: buf });
+        const exif = meta.exif || {};
         item.exif = item.exif || exif;
         item.exifTime = parseExifTime(exif);
         updated = true;
@@ -668,11 +679,80 @@ async function readExifBuffer(file) {
   return await slice.arrayBuffer();
 }
 
+function normalizeExifFromExifr(data) {
+  if (!data || typeof data !== 'object') return {};
+  const exif = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value == null) continue;
+    if (typeof key === 'string' && /^\d+$/.test(key)) continue;
+    if (key === 'xmp' || key === 'XMPMeta') continue;
+    exif[key] = value;
+  }
+  if (exif.latitude != null && exif.GPSLatitude == null) exif.GPSLatitude = exif.latitude;
+  if (exif.longitude != null && exif.GPSLongitude == null) exif.GPSLongitude = exif.longitude;
+  return exif;
+}
+
+function canUseExifr() {
+  return !!(window.exifr && typeof window.exifr.parse === 'function');
+}
+
+async function parseImageMetadata(file, options = {}) {
+  const needXmp = options.needXmp !== false;
+  const headBuffer = options.headBuffer || null;
+  let exif = {};
+  let xmp = null;
+  let source = 'legacy';
+
+  if (canUseExifr()) {
+    try {
+      const exifrOptions = { ...EXIFR_PARSE_OPTIONS_BASE };
+      exifrOptions.xmp = needXmp ? { parse: false } : false;
+      const parsed = await window.exifr.parse(file, exifrOptions);
+      if (parsed && typeof parsed === 'object') {
+        if (needXmp && typeof parsed.xmp === 'string') xmp = parsed.xmp;
+        exif = normalizeExifFromExifr(parsed);
+        source = 'exifr';
+      }
+    } catch (err) {
+      console.debug('[meta] exifr parse failed', { name: file?.name || '(unknown)', message: err?.message || String(err) });
+    }
+  }
+
+  if (!headBuffer && Object.keys(exif).length > 0 && (!needXmp || xmp)) {
+    return { exif, xmp, source };
+  }
+
+  if (Object.keys(exif).length === 0 || (needXmp && !xmp)) {
+    try {
+      const buf = headBuffer || await readExifBuffer(file);
+      if (Object.keys(exif).length === 0) exif = extractExif(buf);
+      if (needXmp && !xmp) xmp = extractXmp(buf);
+      if (source !== 'exifr') source = 'legacy';
+    } catch {
+      // Keep best-effort metadata only.
+    }
+  }
+
+  return { exif: exif || {}, xmp: xmp || null, source };
+}
+
 function parseExifTime(exif) {
   const raw = exif?.DateTimeOriginal || exif?.DateTime;
   if (!raw) return null;
+  if (raw instanceof Date) {
+    const t = raw.getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : null;
+  }
+  if (typeof raw !== 'string') return null;
   const m = raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
-  if (!m) return null;
+  if (!m) {
+    const iso = Date.parse(raw);
+    return Number.isFinite(iso) ? iso : null;
+  }
   const [_, y, mo, d, h, mi, s] = m;
   const date = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
   return date.getTime();
@@ -1028,8 +1108,8 @@ function updateViewerPanel() {
     grid.innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v || '-'}</span>`).join('');
     return;
   }
-  item.file.arrayBuffer().then((buf) => {
-    item.exif = extractExif(buf);
+  parseImageMetadata(item.file, { needXmp: false }).then((meta) => {
+    item.exif = meta.exif || {};
     const rows = buildDetailRows(item);
     grid.innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v || '-'}</span>`).join('');
   }).catch(() => {
@@ -1890,6 +1970,11 @@ Object.assign(TAGS, {
 });
 
 function formatGps(exif) {
+  const latNum = Number(exif.GPSLatitude ?? exif.latitude);
+  const lonNum = Number(exif.GPSLongitude ?? exif.longitude);
+  if (Number.isFinite(latNum) && Number.isFinite(lonNum)) {
+    return `${latNum.toFixed(6)}, ${lonNum.toFixed(6)}`;
+  }
   const lat = exif.GPSLatitude;
   const lon = exif.GPSLongitude;
   if (!Array.isArray(lat) || !Array.isArray(lon) || lat.length < 3 || lon.length < 3) return null;
@@ -2420,11 +2505,20 @@ function analyzeFile(file, byBase) {
 
     try {
       const likelyByName = isLikelyLiveName(file.name);
-      const needExifNow = (state.sortKey || '').startsWith('shot') || likelyByName;
       // Keep Android fast path smaller; use larger head on desktop for better vendor/exif coverage.
       const headReadSize = platformInfo.isAndroid ? 160 * 1024 : 512 * 1024;
       const head = await readHeadBytes(file, headReadSize);
-      const xmp = extractXmp(head);
+      const metadata = await parseImageMetadata(file, { needXmp: true, headBuffer: head });
+      const xmp = metadata.xmp || '';
+      const exif = metadata.exif || {};
+      item.exifChecked = true;
+      if (Object.keys(exif).length) {
+        item.exif = exif;
+        item.exifTime = parseExifTime(exif);
+      }
+      if (metadata.source === 'exifr' && likelyByName) {
+        console.debug('[meta] exifr metadata', { name: file.name, hasXmp: !!xmp, exifKeys: Object.keys(exif).length });
+      }
 
       let vendorType = null;
       let hasMotionTag = false;
@@ -2438,21 +2532,11 @@ function analyzeFile(file, byBase) {
         if (/HONOR|honor/i.test(xmp)) vendorType = 'HONOR Live Photo';
       }
 
-      // HONOR-style Live detection depends on EXIF Make/Model, so parse EXIF broadly on desktop.
-      const shouldParseExif = true;
-      if (shouldParseExif) {
-        const exif = extractExif(head);
-        item.exifChecked = true;
-        if (exif && Object.keys(exif).length) {
-          item.exif = exif;
-          item.exifTime = parseExifTime(exif);
-        }
-        const makeText = String(exif?.Make || '').toLowerCase();
-        const modelText = String(exif?.Model || '').toLowerCase();
-        if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) {
-          vendorType = 'HONOR Live Photo';
-          console.debug('[live-detect] honor exif', { name: file.name, make: exif?.Make || '', model: exif?.Model || '' });
-        }
+      const makeText = String(exif?.Make || '').toLowerCase();
+      const modelText = String(exif?.Model || '').toLowerCase();
+      if (!vendorType && /honor/.test(`${makeText} ${modelText}`)) {
+        vendorType = 'HONOR Live Photo';
+        console.debug('[live-detect] honor exif', { name: file.name, make: exif?.Make || '', model: exif?.Model || '' });
       }
 
       const likelyLive = hasMotionTag || !!vendorType || likelyByName;

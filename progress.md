@@ -232,3 +232,77 @@
 - 下一步：
   1) 用户重测三样本并回传日志。
   2) 若黑闪消失且无重复回退，即可将 `P0-001-02` 标记完成并进入 `P0-001-03`。
+
+## 2026-02-16 02:20（P0-001 总任务重定向 + GitHub 方案筛选）
+- 背景：用户要求从“单浏览器（Edge）专项适配”调整为“通用 Live 播放鲁棒性”，并删除任务池中的 Edge 专项任务描述。
+- 改动文件：`task.md`
+- 改动点：
+  1) 将总任务 `P0-001` 重命名为“通用 Live 播放鲁棒性（总任务）”。
+  2) 将 `P0-001-03 ~ P0-001-06` 从 Edge 专项改为通用任务：
+     - 静音行为一致性
+     - 错误恢复与会话并发治理
+     - 能力驱动回退链与日志规范化
+     - 多浏览器回归验证
+  3) `P0-001-02` 备注从 Edge 定向表述改为通用表述（预览遮罩+回退门控）。
+- 验证证据：
+  - `task.md` 中“进行中/待确认/待进行”分区已完成重命名与验收标准更新。
+- 额外产出（GitHub 方案预选）：
+  - `gpac/mp4box.js`：浏览器内 MP4 box 级解析/重组，适合替代当前手写 strip 逻辑。
+  - `buzz/mediainfo.js`：浏览器内媒体轨道与编码信息探测，适合做能力驱动回退判定。
+  - `ffmpegwasm/ffmpeg.wasm`：浏览器内转码/去音轨兜底，兼容性强但性能开销大。
+  - `MikeKovarik/exifr`：EXIF/XMP 高性能解析，适合稳定识别厂商 Live 元数据。
+  - `wszqkzqk/live-photo-conv`：跨厂商 Live 提取规则参考实现，可用于补齐样本规则。
+- 结果状态：任务池已完成“去 Edge 专项化”，可进入通用方案落地阶段。
+- 下一步：
+  1) 在上面 5 个候选中确定主链路（建议：`mp4box.js + mediainfo.js`）。
+  2) 再决定是否接入 `ffmpeg.wasm` 作为仅失败时触发的重兜底。
+
+## 2026-02-16 02:36（任务编号唯一化 + A/B 方案落地拆解）
+- 背景：用户要求任务编号“唯一对应、避免混淆”，并确认采用 `方案A + 方案B（兜底）`。
+- 改动文件：`task.md`
+- 改动点：
+  1) 全量任务改为全局唯一 ID（`EPIC-*` / `TASK-*`），并增加“原编号”列用于历史追溯。
+  2) 将总任务固定为 `EPIC-LIVE-ROBUST-001`，不再使用易混淆的父子编号形式。
+  3) 按选型完成技术拆解：
+     - A 链路：`TASK-LIVE-A-003` ~ `TASK-LIVE-A-006`（`exifr`、`mediainfo.js`、`mp4box.js`、通用回退决策）
+     - B 兜底：`TASK-LIVE-B-007` ~ `TASK-LIVE-B-008`（`ffmpeg.wasm` 兜底、性能缓存治理）
+     - 回归验收：`TASK-LIVE-RG-009`
+  4) 保留既有任务历史映射（已完成任务从 `DONE-*`/`P*` 映射到新编号）。
+- 验证证据：
+  - `task.md` 已可直接看到唯一编号、原编号映射、A/B 拆解任务和验收标准。
+- 结果状态：编号治理完成；`方案A + B` 已完成任务级拆解，可直接进入实现阶段。
+- 下一步：
+  1) 从 `TASK-LIVE-A-003` 开始实现（元数据解析层统一）。
+  2) 每完成一个子任务即按规范推进 `进行中 -> 待确认`，并追加回归日志。
+
+## 2026-02-16 15:22（TASK-LIVE-A-003：接入 exifr 统一元数据层）
+- 背景：开始执行 `TASK-LIVE-A-003`，目标是将 EXIF/XMP 解析统一到一个可替换层，减少手写解析分叉。
+- 改动文件：
+  - `index.html`
+  - `src/js/app.js`
+  - `task.md`
+- 改动点：
+  1) 新增依赖：`vendor/exifr.full.umd.js` 并在 `index.html` 引入。
+  2) 在 `app.js` 新增统一解析入口：
+     - `parseImageMetadata(file, options)`
+     - `normalizeExifFromExifr(data)`
+     - `canUseExifr()`
+     解析优先走 `exifr`，失败自动回退现有 `extractExif/extractXmp`。
+  3) 将三个元数据读取场景统一接到新入口：
+     - 扫描排序队列 `ensureExifTimes()`
+     - 详情面板 `updateViewerPanel()`
+     - 文件识别主链路 `analyzeFile()`
+  4) 增强时间与 GPS 兼容：
+     - `parseExifTime()` 支持 `Date/number/ISO string`
+     - `formatGps()` 支持十进制度坐标（`latitude/longitude`）与旧数组格式。
+- 验证证据：
+  - 语法检查通过：`node --check src/js/app.js`
+  - 本地样本验证（Node 调 exifr）：
+    - `xiaomi-live.jpg` => `make=Xiaomi`、`hasXmp=true`、`hasMotionTag=true`
+    - `xiaomi-普通.jpg` => `make=Xiaomi`、`hasXmp=true`、`hasMotionTag=false`
+    - `荣耀-live-1.jpg` => `make=HONOR`、`hasXmp=false`（可走 EXIF 厂商判定）
+- 结果状态：
+  - `TASK-LIVE-A-003` 已完成代码实现，状态更新为 `待确认`（待你实机回归）。
+- 下一步：
+  1) 你在 Android/Windows 扫描同一批样本，确认 Live 识别与信息面板字段未回退。
+  2) 通过后进入 `TASK-LIVE-A-004`（引入 `mediainfo.js` 轨道探测）。
