@@ -34,3 +34,27 @@
 ## 6) 新问题处理规则
 - 开发中发现新问题：不插队；写入 `task.md`（或在 `progress.md` 先记录，再回填任务）。
 - 高优问题可由用户显式指定插队。
+
+## 7) MCP 调试经验沉淀（2026-02）
+- `C:\Users\languoer\.codex\config.toml` 的 MCP 改动不会热加载，**必须重启 VSCode** 才会生效。
+- `chrome-devtools-mcp` 推荐配置（已验证可起服务）：
+  - `command = "npx.cmd"`
+  - `args = ["-y","chrome-devtools-mcp@latest","--browser-url=http://127.0.0.1:9222","--logFile=C:\\Users\\languoer\\.codex\\chrome-devtools-mcp.log"]`
+- 常见故障信号：
+  - `timed out awaiting tools/call after 60s`
+  - `Transport closed`
+  - 日志出现 `Parent death detected (stdin end)`（表示 MCP 进程被上游会话中断，不是浏览器端口本身挂掉）。
+- 标准排查顺序（固定执行）：
+  1. `Invoke-WebRequest http://127.0.0.1:9222/json/version` 返回 `200`
+  2. `codex mcp list` / `codex mcp get chrome-devtools` 确认配置已加载
+  3. 运行 MCP `list_pages` 验证链路
+  4. 失败则看 `C:\Users\languoer\.codex\chrome-devtools-mcp.log`
+- 强制重置流程（MCP异常时）：
+  1. 关闭 VSCode
+  2. `taskkill /F /IM node.exe`
+  3. 重新打开 VSCode
+  4. 再执行 `list_pages` 验证
+- Android 远程调试实操结论：
+  - 在 `chrome://inspect/#devices` 可看到设备 `V2502A / com.microsoft.emmx` 与 `Live 图查看器 (http://localhost:8080/)`。
+  - 若出现 `Remote browser is newer than client browser`，优先尝试 `inspect fallback`。
+  - 远程页面容易断连，调试时需保持手机端目标页在前台。

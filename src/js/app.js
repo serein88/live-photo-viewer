@@ -1391,6 +1391,10 @@ async function openLiveVideoInline(item) {
     : (preferOriginalAudio ? item.videoBlob : (item._audioStrippedBlob || item.videoBlob));
   const sourceMode = blobToPlay === item.videoBlob ? 'original' : 'stripped';
   const effectiveMuted = edgeForceStripped ? true : state.liveMuted;
+  // On Android Edge, keep still image visible until canplay to avoid black flash
+  // during original->stripped fallback switching.
+  const deferHideUntilCanPlay = isAndroidEdgeBrowser();
+  let canHidePreview = !deferHideUntilCanPlay;
   video.playsInline = true;
   video.preload = 'auto';
   video.controls = false;
@@ -1411,59 +1415,77 @@ async function openLiveVideoInline(item) {
     canPlayQuickTime: video.canPlayType('video/quicktime')
   });
   let fallbackPromise = null;
+  let fallbackAttempted = blobToPlay !== item.videoBlob;
+  let usingStrippedSource = blobToPlay !== item.videoBlob;
   const fallbackToStripped = async (reason) => {
     if (!isCurrentPlayback()) return false;
-    if (fallbackPromise) return fallbackPromise;
-    fallbackPromise = (async () => {
-      if (!isCurrentPlayback()) return false;
-    let stripped = item._audioStrippedBlob || null;
-    if (!stripped) {
-      stripped = await stripMp4AudioTrack(item.videoBlob);
-      if (stripped) {
-        console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
-        item._audioStrippedBlob = stripped;
-      } else {
-        console.debug('[live-debug] strip audio skipped', { name: item.name, reason });
-      }
-    } else {
-      console.debug('[live-debug] use cached stripped', { name: item.name, reason, sourceMode });
-    }
-    if (!isCurrentPlayback() || !stripped || blobToPlay === stripped) return false;
-    if (isAndroidEdgeBrowser()) {
-      item._edgeForceStripped = true;
-      state.liveMuted = true;
-      const muteBtn = document.querySelector('.viewer-mute-btn');
-      if (muteBtn) {
-        muteBtn.dataset.muted = 'true';
-        muteBtn.title = '当前文件在 Android Edge 无法播放音频';
-      }
-      setStatus('Android Edge 检测到媒体解码不兼容，已自动切换静音播放');
-    }
-    if (!isCurrentPlayback()) return false;
-    setVideoBlobSource(video, stripped);
-    video.currentTime = 0;
-    video.defaultMuted = true;
-    video.muted = true;
-    video.volume = 0;
-    try {
-      await video.play();
-      if (!isCurrentPlayback()) return false;
-      if (state.viewer) updateLiveButton();
-      return true;
-    } catch (retryErr) {
-      console.debug('[live-debug] strip retry reject', {
+    if (usingStrippedSource) {
+      console.debug('[live-debug] fallback skipped', {
         name: item.name,
         reason,
-        message: retryErr?.message || String(retryErr)
+        why: 'already-stripped'
       });
       return false;
     }
-    })();
-    try {
-      return await fallbackPromise;
-    } finally {
-      fallbackPromise = null;
+    if (fallbackAttempted) {
+      console.debug('[live-debug] fallback skipped', {
+        name: item.name,
+        reason,
+        why: 'already-attempted'
+      });
+      return false;
     }
+    fallbackAttempted = true;
+    if (fallbackPromise) return fallbackPromise;
+    fallbackPromise = (async () => {
+      if (!isCurrentPlayback()) return false;
+      let stripped = item._audioStrippedBlob || null;
+      if (!stripped) {
+        stripped = await stripMp4AudioTrack(item.videoBlob);
+        if (stripped) {
+          console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
+          item._audioStrippedBlob = stripped;
+        } else {
+          console.debug('[live-debug] strip audio skipped', { name: item.name, reason });
+        }
+      } else {
+        console.debug('[live-debug] use cached stripped', { name: item.name, reason, sourceMode });
+      }
+      if (!isCurrentPlayback() || !stripped) return false;
+      usingStrippedSource = true;
+      if (isAndroidEdgeBrowser()) {
+        item._edgeForceStripped = true;
+        state.liveMuted = true;
+        const muteBtn = document.querySelector('.viewer-mute-btn');
+        if (muteBtn) {
+          muteBtn.dataset.muted = 'true';
+          muteBtn.title = '当前文件在 Android Edge 无法播放音频';
+        }
+        setStatus('Android Edge 检测到媒体解码不兼容，已自动切换静音播放');
+      }
+      if (!isCurrentPlayback()) return false;
+      setVideoBlobSource(video, stripped);
+      video.currentTime = 0;
+      video.defaultMuted = true;
+      video.muted = true;
+      video.volume = 0;
+      canHidePreview = false;
+      if (previewImage) previewImage.style.opacity = '';
+      try {
+        await video.play();
+        if (!isCurrentPlayback()) return false;
+        if (state.viewer) updateLiveButton();
+        return true;
+      } catch (retryErr) {
+        console.debug('[live-debug] strip retry reject', {
+          name: item.name,
+          reason,
+          message: retryErr?.message || String(retryErr)
+        });
+        return false;
+      }
+    })();
+    return await fallbackPromise;
   };
   if (platformInfo?.isAndroid) {
     detectMp4Tracks(blobToPlay).then((info) => {
@@ -1490,6 +1512,10 @@ async function openLiveVideoInline(item) {
   };
   video.oncanplay = () => {
     console.debug('[live-debug] canplay', { name: item.name });
+    canHidePreview = true;
+    if (state.livePlaying && previewImage) {
+      previewImage.style.opacity = '0';
+    }
   };
   video.onwaiting = () => {
     console.debug('[live-debug] waiting', { name: item.name, t: video.currentTime });
@@ -1528,7 +1554,7 @@ async function openLiveVideoInline(item) {
     closeLiveVideoInline();
   };
   video.onplay = () => {
-    if (previewImage) {
+    if (previewImage && canHidePreview) {
       previewImage.style.opacity = '0';
     }
     state.livePlaying = true;
@@ -1552,15 +1578,11 @@ async function openLiveVideoInline(item) {
       fallbackToStripped('play-reject').then((ok) => {
         if (!isCurrentPlayback()) return;
         if (ok) return;
-        video.muted = true;
-        video.defaultMuted = true;
-        video.controls = true;
-        video.play().catch((retryErr) => {
-          console.debug('[live-debug] retry reject', {
-            name: item.name,
-            message: retryErr?.message || String(retryErr)
-          });
+        console.debug('[live-debug] retry reject', {
+          name: item.name,
+          message: 'fallback failed after play reject'
         });
+        closeLiveVideoInline();
       });
     }
   });
