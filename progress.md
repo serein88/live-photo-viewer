@@ -306,3 +306,98 @@
 - 下一步：
   1) 你在 Android/Windows 扫描同一批样本，确认 Live 识别与信息面板字段未回退。
   2) 通过后进入 `TASK-LIVE-A-004`（引入 `mediainfo.js` 轨道探测）。
+
+## 2026-02-16 15:48（TASK-LIVE-A-004：接入 mediainfo.js 轨道探测）
+- 背景：执行 `TASK-LIVE-A-004`，目标是提供播放前的稳定轨道能力输入，替代单一手写 MP4 解析路径。
+- 改动文件：
+  - `index.html`
+  - `src/js/app.js`
+  - `task.md`
+- 改动点：
+  1) 新增依赖：
+     - `vendor/mediainfo.min.js`
+     - `vendor/MediaInfoModule.wasm`
+     并在页面加载 `mediainfo.min.js`。
+  2) 在 `app.js` 增加通用轨道探测层：
+     - `canUseMediaInfoJs()`
+     - `getMediaInfoInstance()`
+     - `detectTracksWithMediaInfo()`
+     - `detectTracksForPlayback()`
+     支持 `mediainfo.js` 失败自动回退 `detectMp4Tracks()`。
+  3) 增加并发治理：
+     - `mediaInfoAnalyzeQueue` 串行化 WASM 分析，避免并发分析冲突。
+  4) 接入播放链路：
+     - `openLiveVideoInline()` 在播放前先执行轨道探测；
+     - stripped 回退链路也会补充探测并打点。
+  5) 统一日志：
+     - 新增 `[live-debug] track probe`，包含 `sourceMode/source/audio/video/tracks/audioCodec/videoCodec`。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 依赖文件已落地：`vendor/mediainfo.min.js`、`vendor/MediaInfoModule.wasm`。
+  - 运行日志层面新增稳定探测点（可用于后续决策链 `TASK-LIVE-A-006`）。
+- 结果状态：
+  - `TASK-LIVE-A-004` 代码实现完成，状态改为 `待确认`。
+- 下一步：
+  1) 你在 Android/Windows 回归播放，确认每次播放前均输出 `track probe`。
+  2) 通过后进入 `TASK-LIVE-A-005`（引入 `mp4box.js` 去音轨/重组）。
+
+## 2026-02-16 16:02（TASK-LIVE-A-004 回归补丁：轨道日志可见性）
+- 背景：用户反馈在 Android/Windows 控制台无法通过 `track prob` 关键字检索到输出。
+- 改动文件：`src/js/app.js`
+- 改动点：
+  1) 将轨道探测日志从 `console.debug` 升级为 `console.log/console.warn`，避免被 DevTools 默认日志级别隐藏。
+  2) 统一日志前缀为 `[track-probe]`，并补齐分阶段日志：
+     - `start`（探测开始）
+     - `cache`（命中缓存）
+     - `done`（探测完成）
+     - `mediainfo unavailable/init failed/analyze failed`（降级原因）
+  3) 新增一次性降级提示：当 `mediainfo.js` 不可用时明确打印“fallback to mp4 parser”。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+- 结果状态：
+  - `TASK-LIVE-A-004` 维持 `待确认`，等待你按 `[track-probe]` 关键字复测。
+
+## 2026-02-16 16:21（TASK-LIVE-A-004 结项 + TASK-LIVE-A-005 实现）
+- 背景：
+  - 用户确认 Android/Windows 已看到 `[track-probe]` 输出，`TASK-LIVE-A-004` 通过。
+  - 进入下一子任务 `TASK-LIVE-A-005`（mp4box 去音轨/重组）。
+- 改动文件：
+  - `src/js/app.js`
+  - `vendor/mp4box.all.esm.mjs`
+  - `task.md`
+- 改动点（A-005）：
+  1) 新增 mp4box 动态加载链路：
+     - `loadMp4BoxModule()`
+     - 模块路径：`./vendor/mp4box.all.esm.mjs`
+  2) 新增 mp4box 去音轨实现：
+     - `stripMp4AudioTrackWithMp4Box(blob)`
+     - 按“仅视频轨分段+重组”输出无音轨 MP4（init segment + media segments）。
+  3) 保留旧逻辑兜底：
+     - 原手写 box 去音轨逻辑迁移到 `stripMp4AudioTrackLegacy(blob)`；
+     - 新入口 `stripMp4AudioTrack(blob)` 优先 mp4box，失败自动回退 legacy。
+  4) 增加 mp4box 关键日志：
+     - import/append/remux timeout/segment setup 失败日志，便于实机定位。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 依赖文件已落地：`vendor/mp4box.all.esm.mjs`。
+- 任务状态：
+  - `TASK-LIVE-A-004`：完成（已获用户确认）。
+  - `TASK-LIVE-A-005`：待确认（待你实机回归播放稳定性）。
+- 下一步：
+  1) 你在 Android/Windows 各测 vivo/xiaomi/honor，关注是否出现 `[live-debug] strip audio via mp4box`。
+  2) 若出现 remux 失败或超时，回传对应日志，我再收敛 A-005。
+
+## 2026-02-16 16:36（TASK-LIVE-A-005 补丁：mp4box 日志可见性）
+- 背景：用户反馈控制台过滤 `mp4box` 无输出。
+- 改动文件：`src/js/app.js`
+- 改动点：
+  1) 将 mp4box 相关日志统一改为前缀 `[mp4box]`，并从 `debug` 提升为 `log/warn`。
+  2) 在 `stripMp4AudioTrack()` 增加明确阶段日志：
+     - `strip request`
+     - `strip success`
+     - `strip fallback legacy`
+  3) 对 import/append/segment setup/remux timeout/remux failed 均补充 `[mp4box]` 错误日志。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+- 结果状态：
+  - `TASK-LIVE-A-005` 维持 `待确认`，等待你在触发回退场景时验证 `[mp4box]` 日志链。

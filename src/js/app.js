@@ -17,6 +17,8 @@
   scanByBase: null,
 };
 const EXIF_SLICE_SIZE = 256 * 1024;
+const MEDIAINFO_WASM_PATH = 'vendor/MediaInfoModule.wasm';
+const MP4BOX_MODULE_PATH = './vendor/mp4box.all.esm.mjs';
 const EXIFR_PARSE_OPTIONS_BASE = Object.freeze({
   tiff: true,
   ifd0: true,
@@ -28,6 +30,10 @@ const EXIFR_PARSE_OPTIONS_BASE = Object.freeze({
   userComment: false,
 });
 let renderTimer = null;
+let mediaInfoInstancePromise = null;
+let mediaInfoAnalyzeQueue = Promise.resolve();
+let mediaInfoUnavailableLogged = false;
+let mp4BoxModulePromise = null;
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
 const VIDEO_EXTS = new Set(['mp4','mov','m4v','3gp','webm','mkv','avi']);
@@ -1544,6 +1550,8 @@ async function openLiveVideoInline(item) {
         setStatus('Android Edge 检测到媒体解码不兼容，已自动切换静音播放');
       }
       if (!isCurrentPlayback()) return false;
+      await detectTracksForPlayback(stripped, item.name, 'stripped', item);
+      if (!isCurrentPlayback()) return false;
       setVideoBlobSource(video, stripped);
       video.currentTime = 0;
       video.defaultMuted = true;
@@ -1567,17 +1575,7 @@ async function openLiveVideoInline(item) {
     })();
     return await fallbackPromise;
   };
-  if (platformInfo?.isAndroid) {
-    detectMp4Tracks(blobToPlay).then((info) => {
-      console.debug('[live-debug] mp4 tracks', {
-        name: item.name,
-        audio: info.audio,
-        video: info.video,
-        tracks: info.tracks,
-        stripped: !!item._audioStrippedBlob
-      });
-    });
-  }
+  await detectTracksForPlayback(blobToPlay, item.name, sourceMode, item);
   video.onloadedmetadata = () => {
     console.debug('[live-debug] loadedmetadata', {
       name: item.name,
@@ -2231,7 +2229,203 @@ async function detectMp4Tracks(blob) {
   }
 }
 
-async function stripMp4AudioTrack(blob) {
+function canUseMediaInfoJs() {
+  return !!(window.MediaInfo && typeof window.MediaInfo.mediaInfoFactory === 'function');
+}
+
+function createTrackSummaryFromMediaInfo(result) {
+  const tracks = Array.isArray(result?.media?.track) ? result.media.track : [];
+  const audioTracks = tracks.filter((t) => t?.['@type'] === 'Audio');
+  const videoTracks = tracks.filter((t) => t?.['@type'] === 'Video');
+  const audioCodec = audioTracks.map((t) => t?.Format || t?.CodecID || t?.CodecID_Hint).find(Boolean) || '';
+  const videoCodec = videoTracks.map((t) => t?.Format || t?.CodecID || t?.CodecID_Hint).find(Boolean) || '';
+  return {
+    audio: audioTracks.length > 0,
+    video: videoTracks.length > 0,
+    tracks: audioTracks.length + videoTracks.length,
+    audioTracks: audioTracks.length,
+    videoTracks: videoTracks.length,
+    audioCodec,
+    videoCodec,
+    source: 'mediainfo.js',
+  };
+}
+
+async function getMediaInfoInstance() {
+  if (!canUseMediaInfoJs()) {
+    if (!mediaInfoUnavailableLogged) {
+      mediaInfoUnavailableLogged = true;
+      console.warn('[track-probe] mediainfo unavailable; fallback to mp4 parser');
+    }
+    return null;
+  }
+  if (mediaInfoInstancePromise) return mediaInfoInstancePromise;
+  mediaInfoInstancePromise = window.MediaInfo.mediaInfoFactory({
+    format: 'object',
+    locateFile: (path) => (path === 'MediaInfoModule.wasm' ? MEDIAINFO_WASM_PATH : path),
+  }).catch((err) => {
+    console.warn('[track-probe] mediainfo init failed', { message: err?.message || String(err) });
+    mediaInfoInstancePromise = null;
+    return null;
+  });
+  return mediaInfoInstancePromise;
+}
+
+async function detectTracksWithMediaInfo(blob) {
+  const inst = await getMediaInfoInstance();
+  if (!inst) return null;
+  const run = async () => {
+    const result = await inst.analyzeData(
+      blob.size,
+      async (size, offset) => new Uint8Array(await blob.slice(offset, offset + size).arrayBuffer())
+    );
+    return createTrackSummaryFromMediaInfo(result);
+  };
+  mediaInfoAnalyzeQueue = mediaInfoAnalyzeQueue.then(run, run);
+  try {
+    return await mediaInfoAnalyzeQueue;
+  } catch (err) {
+    console.warn('[track-probe] mediainfo analyze failed', { message: err?.message || String(err) });
+    return null;
+  }
+}
+
+async function detectTracksForPlayback(blob, itemName, sourceMode, item) {
+  console.log('[track-probe] start', {
+    name: itemName,
+    sourceMode,
+    hasBlob: !!blob,
+    blobType: blob?.type || '',
+    blobSize: blob?.size || 0
+  });
+  if (!blob) {
+    const emptyInfo = { audio: false, video: false, tracks: 0, audioTracks: 0, videoTracks: 0, audioCodec: '', videoCodec: '', source: 'none' };
+    console.log('[track-probe] done', { name: itemName, sourceMode, ...emptyInfo });
+    return emptyInfo;
+  }
+  if (sourceMode === 'original' && item?._trackInfoOriginal) {
+    console.log('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoOriginal.source || 'cache' });
+    return item._trackInfoOriginal;
+  }
+  if (sourceMode === 'stripped' && item?._trackInfoStripped) {
+    console.log('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoStripped.source || 'cache' });
+    return item._trackInfoStripped;
+  }
+  let info = await detectTracksWithMediaInfo(blob);
+  if (!info) {
+    const fallback = await detectMp4Tracks(blob);
+    info = { ...fallback, audioTracks: fallback.audio ? 1 : 0, videoTracks: fallback.video ? 1 : 0, audioCodec: '', videoCodec: '', source: 'mp4-parser' };
+  }
+  if (sourceMode === 'original' && item) item._trackInfoOriginal = info;
+  if (sourceMode === 'stripped' && item) item._trackInfoStripped = info;
+  console.log('[track-probe] done', {
+    name: itemName,
+    sourceMode,
+    source: info.source,
+    audio: info.audio,
+    video: info.video,
+    tracks: info.tracks,
+    audioTracks: info.audioTracks,
+    videoTracks: info.videoTracks,
+    audioCodec: info.audioCodec,
+    videoCodec: info.videoCodec
+  });
+  return info;
+}
+
+async function loadMp4BoxModule() {
+  if (mp4BoxModulePromise) return mp4BoxModulePromise;
+  mp4BoxModulePromise = import(MP4BOX_MODULE_PATH).catch((err) => {
+    console.warn('[mp4box] import failed', { message: err?.message || String(err) });
+    mp4BoxModulePromise = null;
+    return null;
+  });
+  return mp4BoxModulePromise;
+}
+
+async function stripMp4AudioTrackWithMp4Box(blob) {
+  if (!blob || !blob.size) return null;
+  const mod = await loadMp4BoxModule();
+  if (!mod || typeof mod.createFile !== 'function') return null;
+  const source = await blob.arrayBuffer();
+  const mp4File = mod.createFile();
+  return await new Promise((resolve) => {
+    let settled = false;
+    let videoTrackId = null;
+    let initSegment = null;
+    const mediaSegments = [];
+
+    const finish = (out) => {
+      if (settled) return;
+      settled = true;
+      try { mp4File.stop(); } catch {}
+      resolve(out);
+    };
+
+    const finalizeOutput = () => {
+      if (!initSegment || mediaSegments.length === 0) {
+        finish(null);
+        return;
+      }
+      const merged = [initSegment, ...mediaSegments];
+      finish(new Blob(merged, { type: 'video/mp4' }));
+    };
+
+    mp4File.onError = (err) => {
+      console.warn('[mp4box] remux failed', { message: String(err || '') });
+      finish(null);
+    };
+
+    mp4File.onSegment = (id, user, buffer, sampleNumber, last) => {
+      if (id !== videoTrackId || !buffer) return;
+      mediaSegments.push(buffer.slice(0));
+      if (last) finalizeOutput();
+    };
+
+    mp4File.onReady = (info) => {
+      const tracks = Array.isArray(info?.tracks) ? info.tracks : [];
+      const hasAudio = tracks.some((t) => !!t.audio);
+      const videoTrack = tracks.find((t) => !!t.video);
+      if (!hasAudio || !videoTrack) {
+        finish(null);
+        return;
+      }
+      videoTrackId = videoTrack.id;
+      try {
+        mp4File.setSegmentOptions(videoTrackId, null, { nbSamples: 500, rapAlignement: true });
+        const initSegs = mp4File.initializeSegmentation();
+        const init = Array.isArray(initSegs) ? initSegs.find((s) => s.id === videoTrackId) : null;
+        initSegment = init?.buffer ? init.buffer.slice(0) : null;
+        mp4File.start();
+        mp4File.flush();
+        setTimeout(() => {
+          if (!settled) finalizeOutput();
+        }, 50);
+      } catch (err) {
+        console.warn('[mp4box] segment setup failed', { message: err?.message || String(err) });
+        finish(null);
+      }
+    };
+
+    try {
+      const input = source.slice(0);
+      input.fileStart = 0;
+      mp4File.appendBuffer(input);
+      mp4File.flush();
+      setTimeout(() => {
+        if (!settled) {
+          console.warn('[mp4box] remux timeout');
+          finish(null);
+        }
+      }, 1500);
+    } catch (err) {
+      console.warn('[mp4box] append failed', { message: err?.message || String(err) });
+      finish(null);
+    }
+  });
+}
+
+async function stripMp4AudioTrackLegacy(blob) {
   try {
     const buf = await blob.arrayBuffer();
     const bytes = new Uint8Array(buf);
@@ -2273,6 +2467,17 @@ async function stripMp4AudioTrack(blob) {
   } catch {
     return null;
   }
+}
+
+async function stripMp4AudioTrack(blob) {
+  console.log('[mp4box] strip request', { size: blob?.size || 0, type: blob?.type || '' });
+  const mp4boxResult = await stripMp4AudioTrackWithMp4Box(blob);
+  if (mp4boxResult) {
+    console.log('[mp4box] strip success', { before: blob?.size || 0, after: mp4boxResult.size });
+    return mp4boxResult;
+  }
+  console.warn('[mp4box] strip fallback legacy');
+  return await stripMp4AudioTrackLegacy(blob);
 }
 
 function trimMp4Buffer(buf) {
