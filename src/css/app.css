@@ -675,6 +675,37 @@ body.desktop .grid { grid-template-columns: repeat(auto-fill, minmax(var(--thumb
 .viewer-mute-btn[data-muted="false"]::before {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M11 5 6 9H3v6h3l5 4V5z'/><path d='M15 9a4 4 0 0 1 0 6'/><path d='M19 7a8 8 0 0 1 0 10'/></svg>");
 }
+.viewer-notice {
+  position: absolute;
+  left: 50%;
+  bottom: 72px;
+  transform: translateX(-50%) translateY(10px);
+  min-width: 180px;
+  max-width: min(88vw, 520px);
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.16);
+  background: rgba(8, 12, 20, 0.82);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .16s ease, transform .16s ease;
+  z-index: 2300;
+  white-space: normal;
+}
+.viewer-notice.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.viewer-notice[data-tone="warn"] {
+  border-color: rgba(245, 197, 24, 0.45);
+}
+.viewer-notice[data-tone="ok"] {
+  border-color: rgba(56, 199, 128, 0.45);
+}
 .live-video-overlay {
   position: fixed;
   inset: 0;

@@ -401,3 +401,135 @@
   - 语法检查：`node --check src/js/app.js` 通过。
 - 结果状态：
   - `TASK-LIVE-A-005` 维持 `待确认`，等待你在触发回退场景时验证 `[mp4box]` 日志链。
+
+## 2026-02-16 17:05（TASK-LIVE-A-005 确认完成 + TASK-LIVE-A-006 实施）
+- 背景：
+  - 用户确认 Android Edge 可见 `[mp4box]` 输出，`TASK-LIVE-A-005` 通过。
+  - 按计划进入下一步：`TASK-LIVE-A-006`（通用播放决策链路）。
+- 改动文件：
+  - `src/js/app.js`
+  - `task.md`
+- 改动点（A-006）：
+  1) 移除播放决策中的 Edge 专属硬编码路径：
+     - 不再使用 `isAndroidEdgeBrowser()` / `_edgeForceStripped` 驱动回退决策。
+  2) 建立能力驱动状态位：
+     - 新增 `item._audioUnsupported`（文件级降级状态），用于提示和下次播放策略。
+  3) 初始源选择改为通用规则：
+     - 默认 `original`；
+     - 当用户静音且该文件已判定音频不兼容且存在 stripped 缓存时，优先 `stripped`。
+  4) 回退触发改为运行时错误+能力联合判断：
+     - 依据 `MediaError.code`、错误消息（demux/decode/not supported）和轨道探测结果决定是否回退。
+  5) 静音按钮行为通用化：
+     - 提示文案由 “Android Edge 不兼容” 改为“当前文件音频不兼容”；
+     - 用户取消静音时会清除 `item._audioUnsupported` 并重试有声播放。
+  6) `play().catch` 回退触发不再限定 Android，统一走一次回退尝试。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 代码检索确认：播放链路中已无 `isAndroidEdgeBrowser`/`_edgeForceStripped` 依赖。
+- 任务状态：
+  - `TASK-LIVE-A-005`：完成（已获用户确认）。
+  - `TASK-LIVE-A-006`：待确认（待你实机回归验证）。
+
+## 2026-02-16 17:26（TASK-LIVE-A-006 回归判定：未通过）
+- 背景：用户回传最新实机结果与日志（`docs/temp.md`）：
+  - Windows 三样本稳定；
+  - Android Chrome 三样本稳定；
+  - Android Edge：vivo 可静音播放，但荣耀/小米在有声尝试后仍失败；且未见明确用户界面提示，取消静音后的“重试有声播放”不可感知。
+- 关键证据（`docs/temp.md`）：
+  1) 荣耀/小米在 `sourceMode=original` 时出现：
+     - `video error code:4 DEMUXER_ERROR_DETECTED_AAC`
+     - 随后 `play reject` + `fallback skipped(already-stripped)` + `strip retry reject`
+  2) 失败后虽可再次进入 `sourceMode=stripped`，但用户感知为“没有明确提示、重试行为不明确”。
+- 判定：
+  - `TASK-LIVE-A-006` **不满足验收**，不能标记完成。
+  - 已在 `task.md` 将 `TASK-LIVE-A-006` 调整为 `失败`，并记录阻塞与下一步。
+- 下一步建议（下一轮任务）：
+  1) 增加可见 UI 提示（Toast/Bar）：明确显示“已因音频不兼容切换静音”。
+  2) 显式重试状态：点击取消静音后展示“正在重试有声播放（第 N 次）”及结果。
+  3) 收敛回退竞态：`video-error` 与 `play-reject` 路径统一到单一状态机分支，避免用户看到“点了没反应”。
+
+## 2026-02-16 17:49（TASK-LIVE-A-006 修复版：提示可见性 + 重试反馈 + 回退竞态）
+- 背景：基于 `docs/temp.md` 最新日志，A-006 的主要缺口是“无可见提示、重试感知弱、回退竞态导致二次失败”。
+- 改动文件：
+  - `src/js/app.js`
+  - `src/css/app.css`
+  - `task.md`
+- 改动点：
+  1) 新增预览层可见提示（viewer toast）：
+     - `showViewerNotice(text, { tone, duration })`
+     - 在自动降级静音、重试有声、重试成功/失败时弹出提示。
+  2) 新增重试行为日志与状态：
+     - 文件级 `item._audioRetryCount`、`item._pendingAudioRetry`
+     - 新日志前缀：`[live-retry] start/success/failed/fallback-muted`
+  3) 回退竞态收敛：
+     - `fallbackToStripped()` 增加“join in-flight fallback”逻辑；
+     - 当已在 stripped 路径时返回“已处理”而非失败，避免 `play-reject` 路径误触发关闭。
+  4) 状态同步：
+     - `TASK-LIVE-A-006` 从“失败”恢复到“待确认”，等待本轮实机验证。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 代码关键点：
+    - `showViewerNotice` / `[live-retry]` / `fallback join` 分支已就位。
+- 结果状态：
+  - `TASK-LIVE-A-006`：待确认（修复版待回归）。
+- 下一步：
+  1) 你在 Android Edge 用 vivo/荣耀/小米复测：
+     - 是否出现“自动切静音”的可见提示；
+     - 取消静音后是否出现“第 N 次重试”与“成功/失败”提示；
+     - 是否不再出现此前 `play-reject` 导致的“看起来没反应”。
+
+## 2026-02-17 14:18（TASK-LIVE-A-006 判定完成 + TASK-DOC-HANDOFF-401 启动）
+- 背景：
+  - 用户要求基于 `docs/temp.md` 的“日志2 安卓端”判断 `TASK-LIVE-A-006` 是否可完成。
+  - 用户要求新增“让下一位 AI 可直接接手”的任务，并立即开始。
+- 判定（A-006）：
+  - 结论：`TASK-LIVE-A-006` 可转 `完成`。
+  - 依据（`docs/temp.md`）：
+    1) `fallback join` 已出现，说明 `play-reject` 与 `video-error` 已收敛到同一回退链路（`docs/temp.md:449`、`docs/temp.md:586`、`docs/temp.md:706`）。
+    2) vivo/honor/xiaomi 在该轮日志都能闭环到 `live ended`（`docs/temp.md:477`、`docs/temp.md:598`、`docs/temp.md:718`）。
+    3) 无浏览器名硬编码判定日志，回退依据为运行时错误+轨道信息，符合 A-006 验收口径。
+- 新任务（文档接手）：
+  - 新建：`TASK-DOC-HANDOFF-401`（待确认）。
+  - 产出：
+    - 新增 `docs/AI_HANDOFF.md`，覆盖启动方式、状态模型、播放链路、回归标准、调试顺序、已知风险。
+    - 更新 `README.md` 增加接手文档入口。
+  - 本轮不进入 `TASK-LIVE-B-007`（按用户要求暂停）。
+- 额外风险记录（未插队修复）：
+  - 发现 `mp4box` 动态导入路径在 HTTP 模式下存在失败（`docs/temp.md:513`、`docs/temp.md:633`），当前由 legacy strip 兜底，功能可用但存在技术债。
+
+## 2026-02-17 20:33（TASK-DOC-HANDOFF-401 文档补全：逐文件职责）
+- 背景：
+  - 用户要求 `docs/AI_HANDOFF.md` 再详细，补齐“每个文件的作用”。
+- 改动文件：
+  - `docs/AI_HANDOFF.md`
+  - `task.md`
+- 改动点：
+  1) 将 handoff 文档升级为“完整目录级说明”，覆盖当前仓库内所有核心文件与 vendor 依赖文件用途。
+  2) 增加结构化分节：
+     - 根目录文件职责；
+     - 业务代码职责；
+     - 第三方依赖职责；
+     - 脚本职责；
+     - docs 日志文件职责。
+  3) 保留并强化接手必读内容：播放主链路、数据模型、回归口径、已知风险、推荐排查顺序。
+  4) 在 `task.md` 的 `TASK-DOC-HANDOFF-401` 备注中标注“已补充完整文件清单 + 每文件作用”，状态保持 `待确认`。
+- 验证证据：
+  - `docs/AI_HANDOFF.md` 已包含文件清单与作用说明，可直接用于后续 AI 冷启动接手。
+- 结果状态：
+  - `TASK-DOC-HANDOFF-401`：待确认（等待用户确认文档可读性与完整性）。
+
+## 2026-02-17（状态核对：TASK-DOC-HANDOFF-401 完成确认 + TASK-LIVE-STATE-002 判定完成）
+- 背景：
+  - 用户确认 `TASK-DOC-HANDOFF-401` 已完成。
+  - 用户要求核对 `TASK-LIVE-STATE-002` 是否可完成。
+- 改动文件：
+  - `task.md`
+- 核对证据（`docs/temp.md`）：
+  1) 在“日志2 安卓端”中，三样本均出现 `fallback join`，表明 `video-error` 与 `play-reject` 已收敛到单一回退链路（`docs/temp.md:449`、`docs/temp.md:586`、`docs/temp.md:706`）。
+  2) 三样本均形成播放闭环并出现 `live ended`（`docs/temp.md:477`、`docs/temp.md:598`、`docs/temp.md:718`）。
+  3) `strip retry reject` / `retry reject` 仅出现在较早日志段（`docs/temp.md:68-219`），未在“日志2 安卓端”复现。
+- 结果状态：
+  - `TASK-DOC-HANDOFF-401`：完成。
+  - `TASK-LIVE-STATE-002`：完成。
+- 下一步：
+  1) 继续执行 `TASK-LIVE-B-007`（`ffmpeg.wasm` 兜底链路）。
