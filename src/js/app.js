@@ -7,6 +7,7 @@
   viewer: null,
   liveMuted: true,
   livePlaying: false,
+  livePathMode: 'auto',
   layout: 'auto',
   scanning: false,
   sortKey: 'mtime_desc',
@@ -19,6 +20,31 @@
 const EXIF_SLICE_SIZE = 256 * 1024;
 const MEDIAINFO_WASM_PATH = 'vendor/MediaInfoModule.wasm';
 const MP4BOX_MODULE_PATH = './vendor/mp4box.all.esm.mjs';
+const FFMPEG_CORE_PATH = 'vendor/ffmpeg-core.js';
+const FFMPEG_WASM_PATH = 'vendor/ffmpeg-core.wasm';
+const FFMPEG_WORKER_PATH = 'vendor/ffmpeg-core.worker.js';
+const FFMPEG_CORE_MAIN_NAME = 'main';
+const FFMPEG_ASSET_VERSION = 'core-st-20260218-1';
+const ENABLE_VERBOSE_DEBUG_LOGS = typeof window !== 'undefined' && !!window.__LPV_VERBOSE_DEBUG__;
+const MUTED_DEBUG_PREFIXES = Object.freeze([
+  '[viewer]',
+  '[viewer-nav]',
+  '[live-debug]',
+  '[grid]',
+  '[picker-debug]',
+  '[dir-pick]',
+  '[meta]',
+  '[live-detect]',
+  '[track-probe]',
+]);
+const ORIGINAL_CONSOLE_DEBUG = typeof console !== 'undefined' && console.debug ? console.debug.bind(console) : null;
+if (ORIGINAL_CONSOLE_DEBUG && !ENABLE_VERBOSE_DEBUG_LOGS) {
+  console.debug = (...args) => {
+    const head = typeof args?.[0] === 'string' ? args[0] : '';
+    if (MUTED_DEBUG_PREFIXES.some((prefix) => head.startsWith(prefix))) return;
+    ORIGINAL_CONSOLE_DEBUG(...args);
+  };
+}
 const EXIFR_PARSE_OPTIONS_BASE = Object.freeze({
   tiff: true,
   ifd0: true,
@@ -34,6 +60,9 @@ let mediaInfoInstancePromise = null;
 let mediaInfoAnalyzeQueue = Promise.resolve();
 let mediaInfoUnavailableLogged = false;
 let mp4BoxModulePromise = null;
+let ffmpegInstancePromise = null;
+let ffmpegRunQueue = Promise.resolve();
+let ffmpegUnavailableLogged = false;
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
 const VIDEO_EXTS = new Set(['mp4','mov','m4v','3gp','webm','mkv','avi']);
@@ -52,6 +81,7 @@ const el = {
   filterStill: document.getElementById('filterStill'),
   clearSel: document.getElementById('clearSel'),
   sortSelect: document.getElementById('sortSelect'),
+  playbackPathSelect: document.getElementById('playbackPathSelect'),
   viewerGallery: document.getElementById('viewerGallery'),
 };
 
@@ -78,6 +108,7 @@ function bindGridEvents() {
 
 let navIdleTimer = null;
 let navBound = false;
+let navActivityTick = 0;
 
 function detectPlatform() {
   const ua = navigator.userAgent || '';
@@ -178,6 +209,16 @@ function setFilter(f) {
   renderGrid();
 }
 
+function getLivePathMode() {
+  const raw = el.playbackPathSelect?.value || state.livePathMode || 'auto';
+  return raw === 'b_force' ? 'b_force' : 'auto';
+}
+state.livePathMode = getLivePathMode();
+
+function isForcedBPathMode() {
+  return getLivePathMode() === 'b_force';
+}
+
 function getFileExt(name) {
   if (!name) return '';
   const idx = name.lastIndexOf('.');
@@ -230,6 +271,24 @@ function setVideoBlobSource(video, blob) {
   video._objectUrl = url;
   video.src = url;
   return url;
+}
+
+function sleep(ms) {
+  const delay = Number.isFinite(ms) ? Math.max(0, ms) : 0;
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function applyVideoAudioState(video, muted) {
+  if (!video) return;
+  const isMuted = !!muted;
+  video.defaultMuted = isMuted;
+  video.muted = isMuted;
+  video.volume = isMuted ? 0 : 1;
+  if (isMuted) {
+    video.setAttribute('muted', '');
+  } else {
+    video.removeAttribute('muted');
+  }
 }
 
 function diagnosePickerSource(files, source) {
@@ -387,6 +446,19 @@ el.clearSel.onclick = () => { state.selection.clear(); renderGrid({ skipGallery:
 el.sortSelect.addEventListener('change', () => {
   renderGrid();
 });
+if (el.playbackPathSelect) {
+  el.playbackPathSelect.addEventListener('change', () => {
+    const mode = getLivePathMode();
+    state.livePathMode = mode;
+    const label = mode === 'b_force' ? '临时强制B链路（ffmpeg）' : '自动链路（A优先）';
+    setStatus(`播放链路已切换：${label}`);
+    console.log('[live-path] mode', { mode });
+    const current = state.viewer && state.filtered ? state.filtered[state.viewer.index] : null;
+    if (current?.isLive && state.livePlaying) {
+      openLiveVideoInline(current);
+    }
+  });
+}
 
 el.filePicker.addEventListener('change', () => {
   handleSelectedFiles(el.filePicker.files || [], 'file');
@@ -1286,8 +1358,13 @@ function updateSideNavPosition(open) {
 function bindViewerActivity(container) {
   if (!container || navBound) return;
   navBound = true;
-  const reset = () => armNavIdle();
-  ['mousemove', 'mousedown', 'wheel', 'keydown', 'touchstart', 'pointermove'].forEach((evt) => {
+  const reset = () => {
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now - navActivityTick < 220) return;
+    navActivityTick = now;
+    armNavIdle();
+  };
+  ['mousemove', 'mousedown', 'wheel', 'keydown', 'touchstart'].forEach((evt) => {
     container.addEventListener(evt, reset, { passive: true });
     window.addEventListener(evt, reset, { passive: true });
   });
@@ -1429,6 +1506,13 @@ function updateLiveButton() {
     muteBtn.addEventListener('click', () => {
       const currentItem = state.viewer ? state.filtered[state.viewer.index] : null;
       const nextMuted = !state.liveMuted;
+      const sourceModeNow = currentItem?._lastLiveSourceMode || 'original';
+      if (!nextMuted && isForcedBPathMode() && sourceModeNow === 'stripped') {
+        const text = '当前为B链路（ffmpeg去音轨），仅支持静音播放；请切回“自动（A优先）”后再重试有声。';
+        setStatus(text);
+        showViewerNotice(text, { tone: 'warn', duration: 3000 });
+        return;
+      }
       if (!nextMuted && currentItem?._audioUnsupported) {
         // User explicitly retries audio on a previously degraded item.
         currentItem._audioUnsupported = false;
@@ -1444,8 +1528,7 @@ function updateLiveButton() {
       const layer = document.querySelector('.viewer-live-video');
       const video = layer?.querySelector('video');
       if (video) {
-        video.muted = state.liveMuted;
-        video.volume = state.liveMuted ? 0 : 1;
+        applyVideoAudioState(video, state.liveMuted);
       }
       // On Android, when user explicitly unmutes, re-open using original blob first.
       if (!state.liveMuted && platformInfo?.isAndroid && state.viewer) {
@@ -1464,9 +1547,11 @@ function updateLiveButton() {
     btn.classList.add('active');
     btn.classList.remove('hidden');
     muteBtn.classList.remove('hidden');
-    const audioBlocked = !!current._audioUnsupported;
+    const audioBlocked = !!current._audioUnsupported || isForcedBPathMode();
     muteBtn.dataset.audioBlocked = audioBlocked ? 'true' : 'false';
-    muteBtn.title = audioBlocked ? '当前文件音频不兼容，已自动切换静音播放' : '静音/取消静音';
+    muteBtn.title = isForcedBPathMode()
+      ? '当前为B链路（ffmpeg去音轨），仅支持静音播放'
+      : (audioBlocked ? '当前文件音频不兼容，已自动切换静音播放' : '静音/取消静音');
   } else {
     btn.classList.remove('active');
     btn.classList.add('hidden');
@@ -1487,10 +1572,51 @@ async function openLiveVideoInline(item) {
   video._playbackToken = playbackToken;
   const isCurrentPlayback = () => Number(video._playbackToken || 0) === playbackToken;
   const previewImage = state.viewer?.image || null;
-  const preferSanitized = !!(state.liveMuted && item._audioUnsupported && item._audioStrippedBlob);
-  const blobToPlay = preferSanitized ? item._audioStrippedBlob : item.videoBlob;
-  const sourceMode = blobToPlay === item.videoBlob ? 'original' : 'stripped';
-  const effectiveMuted = state.liveMuted;
+  const livePathMode = getLivePathMode();
+  let blobToPlay = item.videoBlob;
+  let sourceMode = 'original';
+  let effectiveMuted = state.liveMuted;
+  if (livePathMode === 'b_force' && item.videoBlob) {
+    let forcedBBlob = item._audioStrippedBlobFfmpeg || null;
+    if (!forcedBBlob) {
+      if (!item._audioStrippedBlobFfmpegPromise) {
+        item._audioStrippedBlobFfmpegPromise = stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name)
+          .finally(() => { item._audioStrippedBlobFfmpegPromise = null; });
+      }
+      forcedBBlob = await item._audioStrippedBlobFfmpegPromise;
+      if (!isCurrentPlayback()) return;
+      if (forcedBBlob) item._audioStrippedBlobFfmpeg = forcedBBlob;
+    }
+    if (forcedBBlob) {
+      item._audioStrippedBlob = forcedBBlob;
+      item._audioUnsupported = true;
+      blobToPlay = forcedBBlob;
+      sourceMode = 'stripped';
+      effectiveMuted = true;
+      state.liveMuted = true;
+      showViewerNotice('临时测试：已强制使用B链路（ffmpeg）', { duration: 1800 });
+      setStatus('当前为B链路（ffmpeg去音轨），仅支持静音播放');
+    } else {
+      console.warn('[live-path] b_force unavailable; fallback auto', { name: item.name });
+      showViewerNotice('B链路不可用，已回退自动链路', { tone: 'warn', duration: 2400 });
+    }
+  }
+  if (!isCurrentPlayback()) return;
+  if (sourceMode === 'original') {
+    const preferSanitized = !!(state.liveMuted && item._audioUnsupported && item._audioStrippedBlob);
+    if (preferSanitized) {
+      blobToPlay = item._audioStrippedBlob;
+      sourceMode = 'stripped';
+      effectiveMuted = true;
+    }
+  }
+  console.log('[live-path] open', {
+    name: item?.name || '',
+    mode: livePathMode,
+    sourceMode,
+    muted: effectiveMuted,
+    audioUnsupported: !!item?._audioUnsupported
+  });
   // Keep still image visible until canplay on mobile to reduce transient black flash.
   const deferHideUntilCanPlay = !!platformInfo?.isAndroid;
   let canHidePreview = !deferHideUntilCanPlay;
@@ -1499,14 +1625,15 @@ async function openLiveVideoInline(item) {
   video.controls = false;
   setVideoBlobSource(video, blobToPlay);
   video.currentTime = 0;
-  video.defaultMuted = effectiveMuted;
-  video.muted = effectiveMuted;
-  video.volume = effectiveMuted ? 0 : 1;
+  applyVideoAudioState(video, effectiveMuted);
+  item._lastLiveSourceMode = sourceMode;
+  item._lastLivePathMode = livePathMode;
   console.debug('[live-debug] open', {
     name: item.name,
     blobType: blobToPlay?.type || '(empty)',
     blobSize: blobToPlay?.size || 0,
     sourceMode,
+    livePathMode,
     muted: effectiveMuted,
     audioUnsupported: !!item._audioUnsupported,
     isAndroid: !!platformInfo?.isAndroid,
@@ -1544,7 +1671,7 @@ async function openLiveVideoInline(item) {
       if (!isCurrentPlayback()) return false;
       let stripped = item._audioStrippedBlob || null;
       if (!stripped) {
-        stripped = await stripMp4AudioTrack(item.videoBlob);
+        stripped = await stripMp4AudioTrack(item.videoBlob, { itemName: item.name });
         if (stripped) {
           console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
           item._audioStrippedBlob = stripped;
@@ -1555,49 +1682,69 @@ async function openLiveVideoInline(item) {
         console.debug('[live-debug] use cached stripped', { name: item.name, reason, sourceMode });
       }
       if (!isCurrentPlayback() || !stripped) return false;
-      usingStrippedSource = true;
-      item._audioUnsupported = true;
-      state.liveMuted = true;
-      const muteBtn = document.querySelector('.viewer-mute-btn');
-      if (muteBtn) {
-        muteBtn.dataset.muted = 'true';
-        muteBtn.dataset.audioBlocked = 'true';
-        muteBtn.title = '当前文件音频不兼容，已自动切换静音播放';
-      }
-      const degradedText = '检测到音频不兼容，已自动切换静音播放';
-      setStatus(degradedText);
-      showViewerNotice(degradedText, { tone: 'warn', duration: 2600 });
-      if (item._pendingAudioRetry) {
-        item._pendingAudioRetry = false;
-        console.log('[live-retry] fallback-muted', { name: item.name, reason });
-      }
-      if (!isCurrentPlayback()) return false;
-      await detectTracksForPlayback(stripped, item.name, 'stripped', item);
-      if (!isCurrentPlayback()) return false;
-      setVideoBlobSource(video, stripped);
-      video.currentTime = 0;
-      video.defaultMuted = true;
-      video.muted = true;
-      video.volume = 0;
-      canHidePreview = false;
-      if (previewImage) previewImage.style.opacity = '';
-      try {
-        await video.play();
+      const applyMutedUiState = () => {
+        usingStrippedSource = true;
+        item._audioUnsupported = true;
+        state.liveMuted = true;
+        const muteBtn = document.querySelector('.viewer-mute-btn');
+        if (muteBtn) {
+          muteBtn.dataset.muted = 'true';
+          muteBtn.dataset.audioBlocked = 'true';
+          muteBtn.title = '当前文件音频不兼容，已自动切换静音播放';
+        }
+        const degradedText = '检测到音频不兼容，已自动切换静音播放';
+        setStatus(degradedText);
+        showViewerNotice(degradedText, { tone: 'warn', duration: 2600 });
+        if (item._pendingAudioRetry) {
+          item._pendingAudioRetry = false;
+          console.log('[live-retry] fallback-muted', { name: item.name, reason });
+        }
+      };
+      const playSanitizedBlob = async (sanitizedBlob, sourceTag, forceTrackRefresh = false) => {
+        if (!isCurrentPlayback() || !sanitizedBlob) return false;
+        applyMutedUiState();
+        item._lastLiveSourceMode = 'stripped';
+        item._lastLivePathMode = livePathMode;
+        if (forceTrackRefresh && item) {
+          item._trackInfoStripped = null;
+        }
+        await detectTracksForPlayback(sanitizedBlob, item.name, 'stripped', item);
         if (!isCurrentPlayback()) return false;
-        if (state.viewer) updateLiveButton();
-        return true;
-      } catch (retryErr) {
-        console.debug('[live-debug] strip retry reject', {
-          name: item.name,
-          reason,
-          message: retryErr?.message || String(retryErr)
-        });
-        return false;
-      }
+        setVideoBlobSource(video, sanitizedBlob);
+        video.currentTime = 0;
+        applyVideoAudioState(video, true);
+        canHidePreview = false;
+        if (previewImage) previewImage.style.opacity = '';
+        try {
+          await video.play();
+          if (!isCurrentPlayback()) return false;
+          if (state.viewer) updateLiveButton();
+          return true;
+        } catch (retryErr) {
+          console.debug('[live-debug] strip retry reject', {
+            name: item.name,
+            reason,
+            sourceTag,
+            message: retryErr?.message || String(retryErr)
+          });
+          return false;
+        }
+      };
+      let played = await playSanitizedBlob(stripped, 'a-chain');
+      if (played) return true;
+      if (!isCurrentPlayback()) return false;
+      console.warn('[ffmpeg-fallback] trigger after sanitized play failed', { name: item.name, reason });
+      const ffmpegStripped = await stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name);
+      if (!ffmpegStripped || !isCurrentPlayback()) return false;
+      item._audioStrippedBlob = ffmpegStripped;
+      played = await playSanitizedBlob(ffmpegStripped, 'ffmpeg', true);
+      return played;
     })();
     return await fallbackPromise;
   };
   const initialTrackInfo = await detectTracksForPlayback(blobToPlay, item.name, sourceMode, item);
+  if (!isCurrentPlayback()) return;
+  const shouldForceAudible = livePathMode === 'auto' && sourceMode === 'original' && !state.liveMuted;
   video.onloadedmetadata = () => {
     console.debug('[live-debug] loadedmetadata', {
       name: item.name,
@@ -1612,6 +1759,9 @@ async function openLiveVideoInline(item) {
   };
   video.oncanplay = () => {
     console.debug('[live-debug] canplay', { name: item.name });
+    if (shouldForceAudible) {
+      applyVideoAudioState(video, false);
+    }
     canHidePreview = true;
     if (item._pendingAudioRetry && !video.muted) {
       item._pendingAudioRetry = false;
@@ -1671,6 +1821,9 @@ async function openLiveVideoInline(item) {
     closeLiveVideoInline();
   };
   video.onplay = () => {
+    if (shouldForceAudible) {
+      applyVideoAudioState(video, false);
+    }
     if (previewImage && canHidePreview) {
       previewImage.style.opacity = '0';
     }
@@ -2335,7 +2488,7 @@ async function detectTracksWithMediaInfo(blob) {
 }
 
 async function detectTracksForPlayback(blob, itemName, sourceMode, item) {
-  console.log('[track-probe] start', {
+  console.debug('[track-probe] start', {
     name: itemName,
     sourceMode,
     hasBlob: !!blob,
@@ -2344,15 +2497,15 @@ async function detectTracksForPlayback(blob, itemName, sourceMode, item) {
   });
   if (!blob) {
     const emptyInfo = { audio: false, video: false, tracks: 0, audioTracks: 0, videoTracks: 0, audioCodec: '', videoCodec: '', source: 'none' };
-    console.log('[track-probe] done', { name: itemName, sourceMode, ...emptyInfo });
+    console.debug('[track-probe] done', { name: itemName, sourceMode, ...emptyInfo });
     return emptyInfo;
   }
   if (sourceMode === 'original' && item?._trackInfoOriginal) {
-    console.log('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoOriginal.source || 'cache' });
+    console.debug('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoOriginal.source || 'cache' });
     return item._trackInfoOriginal;
   }
   if (sourceMode === 'stripped' && item?._trackInfoStripped) {
-    console.log('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoStripped.source || 'cache' });
+    console.debug('[track-probe] cache', { name: itemName, sourceMode, source: item._trackInfoStripped.source || 'cache' });
     return item._trackInfoStripped;
   }
   let info = await detectTracksWithMediaInfo(blob);
@@ -2362,7 +2515,7 @@ async function detectTracksForPlayback(blob, itemName, sourceMode, item) {
   }
   if (sourceMode === 'original' && item) item._trackInfoOriginal = info;
   if (sourceMode === 'stripped' && item) item._trackInfoStripped = info;
-  console.log('[track-probe] done', {
+  console.debug('[track-probe] done', {
     name: itemName,
     sourceMode,
     source: info.source,
@@ -2385,6 +2538,152 @@ async function loadMp4BoxModule() {
     return null;
   });
   return mp4BoxModulePromise;
+}
+
+function canUseFfmpegWasm() {
+  return !!(window.FFmpeg && typeof window.FFmpeg.createFFmpeg === 'function' && typeof window.FFmpeg.fetchFile === 'function');
+}
+
+async function getFfmpegInstance() {
+  if (!canUseFfmpegWasm()) {
+    if (!ffmpegUnavailableLogged) {
+      ffmpegUnavailableLogged = true;
+      console.warn('[ffmpeg-fallback] runtime unavailable; skip ffmpeg.wasm fallback');
+    }
+    return null;
+  }
+  if (ffmpegInstancePromise) return ffmpegInstancePromise;
+  ffmpegInstancePromise = (async () => {
+    const { createFFmpeg } = window.FFmpeg;
+    const coreUrlObj = new URL(FFMPEG_CORE_PATH, window.location.href);
+    const wasmUrlObj = new URL(FFMPEG_WASM_PATH, window.location.href);
+    const workerUrlObj = new URL(FFMPEG_WORKER_PATH, window.location.href);
+    coreUrlObj.searchParams.set('v', FFMPEG_ASSET_VERSION);
+    wasmUrlObj.searchParams.set('v', FFMPEG_ASSET_VERSION);
+    workerUrlObj.searchParams.set('v', FFMPEG_ASSET_VERSION);
+    const coreUrl = coreUrlObj.toString();
+    const wasmUrl = wasmUrlObj.toString();
+    const workerUrl = workerUrlObj.toString();
+    const ffmpeg = createFFmpeg({
+      log: false,
+      corePath: coreUrl,
+      wasmPath: wasmUrl,
+      workerPath: workerUrl,
+      mainName: FFMPEG_CORE_MAIN_NAME,
+    });
+    console.log('[ffmpeg-fallback] load start', {
+      coreUrl,
+      wasmUrl,
+      workerUrl,
+      hasSharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined'
+    });
+    await ffmpeg.load();
+    console.log('[ffmpeg-fallback] load success');
+    return ffmpeg;
+  })().catch((err) => {
+    console.warn('[ffmpeg-fallback] load failed', { message: err?.message || String(err) });
+    ffmpegInstancePromise = null;
+    return null;
+  });
+  return ffmpegInstancePromise;
+}
+
+function resetFfmpegInstance(reason = '') {
+  const current = ffmpegInstancePromise;
+  ffmpegInstancePromise = null;
+  if (reason) {
+    console.warn('[ffmpeg-fallback] instance reset', { reason });
+  }
+  if (!current) return;
+  current.then((ffmpeg) => {
+    try { ffmpeg.exit(); } catch {}
+  }).catch(() => {});
+}
+
+async function stripMp4AudioTrackWithFfmpeg(blob, itemName = '') {
+  if (!blob || !blob.size) return null;
+  const isBusyError = (err) => /can only run one command at a time/i.test(err?.message || String(err || ''));
+  const isExitZeroError = (err) => /exit\(0\)/i.test(err?.message || String(err || ''));
+  const readOutputBytes = (ffmpeg, outputName) => {
+    try {
+      const out = ffmpeg.FS('readFile', outputName);
+      return out && out.length ? out : null;
+    } catch {
+      return null;
+    }
+  };
+  const runWithBusyRetry = async (ffmpeg, args, phase) => {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await ffmpeg.run(...args);
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (isBusyError(err) && attempt < 5) {
+          console.warn('[ffmpeg-fallback] run busy; retry', { name: itemName, phase, attempt });
+          await sleep(120 * attempt);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr || new Error('ffmpeg run failed');
+  };
+  const runJob = async (allowRecovery = true) => {
+    const ffmpeg = await getFfmpegInstance();
+    if (!ffmpeg) return null;
+    const fetchFile = window.FFmpeg.fetchFile;
+    const input = `live-in-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`;
+    const output = `live-out-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`;
+    const cleanup = () => {
+      try { ffmpeg.FS('unlink', input); } catch {}
+      try { ffmpeg.FS('unlink', output); } catch {}
+    };
+    try {
+      console.log('[ffmpeg-fallback] strip request', { name: itemName, size: blob.size, type: blob.type || '' });
+      ffmpeg.FS('writeFile', input, await fetchFile(blob));
+      try {
+        await runWithBusyRetry(ffmpeg, ['-i', input, '-map', '0:v:0', '-c:v', 'copy', '-an', '-movflags', '+faststart', output], 'primary');
+      } catch (errPrimary) {
+        console.warn('[ffmpeg-fallback] strip primary failed', { name: itemName, message: errPrimary?.message || String(errPrimary) });
+        if (isBusyError(errPrimary)) throw errPrimary;
+        const primaryOut = readOutputBytes(ffmpeg, output);
+        if (primaryOut) {
+          const result = new Blob([primaryOut], { type: 'video/mp4' });
+          console.log('[ffmpeg-fallback] strip success after primary soft-fail', { name: itemName, before: blob.size, after: result.size });
+          cleanup();
+          return result;
+        }
+        if (isExitZeroError(errPrimary)) {
+          await sleep(80);
+        }
+        try { ffmpeg.FS('unlink', output); } catch {}
+        await runWithBusyRetry(ffmpeg, ['-i', input, '-c', 'copy', '-an', '-movflags', '+faststart', output], 'fallback');
+      }
+      const out = readOutputBytes(ffmpeg, output);
+      if (!out || !out.length) {
+        console.warn('[ffmpeg-fallback] strip produced empty output', { name: itemName });
+        cleanup();
+        return null;
+      }
+      const result = new Blob([out], { type: 'video/mp4' });
+      console.log('[ffmpeg-fallback] strip success', { name: itemName, before: blob.size, after: result.size });
+      cleanup();
+      return result;
+    } catch (err) {
+      if (allowRecovery && isBusyError(err)) {
+        resetFfmpegInstance('busy-stuck');
+        await sleep(180);
+        return await runJob(false);
+      }
+      console.warn('[ffmpeg-fallback] strip failed', { name: itemName, message: err?.message || String(err) });
+      cleanup();
+      return null;
+    }
+  };
+  ffmpegRunQueue = ffmpegRunQueue.then(runJob, runJob);
+  return await ffmpegRunQueue;
 }
 
 async function stripMp4AudioTrackWithMp4Box(blob) {
@@ -2513,15 +2812,22 @@ async function stripMp4AudioTrackLegacy(blob) {
   }
 }
 
-async function stripMp4AudioTrack(blob) {
-  console.log('[mp4box] strip request', { size: blob?.size || 0, type: blob?.type || '' });
+async function stripMp4AudioTrack(blob, options = {}) {
+  const { itemName = '' } = options;
+  console.log('[mp4box] strip request', { size: blob?.size || 0, type: blob?.type || '', itemName });
   const mp4boxResult = await stripMp4AudioTrackWithMp4Box(blob);
   if (mp4boxResult) {
     console.log('[mp4box] strip success', { before: blob?.size || 0, after: mp4boxResult.size });
     return mp4boxResult;
   }
   console.warn('[mp4box] strip fallback legacy');
-  return await stripMp4AudioTrackLegacy(blob);
+  const legacyResult = await stripMp4AudioTrackLegacy(blob);
+  if (legacyResult) {
+    console.log('[mp4box] strip success legacy', { before: blob?.size || 0, after: legacyResult.size });
+    return legacyResult;
+  }
+  console.warn('[mp4box] strip fallback ffmpeg');
+  return await stripMp4AudioTrackWithFfmpeg(blob, itemName);
 }
 
 function trimMp4Buffer(buf) {

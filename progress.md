@@ -533,3 +533,180 @@
   - `TASK-LIVE-STATE-002`：完成。
 - 下一步：
   1) 继续执行 `TASK-LIVE-B-007`（`ffmpeg.wasm` 兜底链路）。
+
+## 2026-02-17（TASK-LIVE-B-007 实施：接入 ffmpeg.wasm 重兜底）
+- 背景：
+  - 用户要求继续 `EPIC-LIVE-ROBUST-001`，进入子任务 `TASK-LIVE-B-007`。
+  - 目标是“仅在 A 链路失败时触发 ffmpeg.wasm”，并保持离线可运行。
+- 改动文件：
+  - `index.html`
+  - `src/js/app.js`
+  - `vendor/ffmpeg.min.js`
+  - `vendor/046d0074eee1d99a674a.js`
+  - `vendor/ffmpeg-core.js`
+  - `vendor/ffmpeg-core.wasm`
+  - `vendor/ffmpeg-core.worker.js`
+  - `task.md`
+- 改动点：
+  1) 引入 ffmpeg.wasm 前端运行时（本地 vendor）：
+     - 在 `index.html` 新增 `vendor/ffmpeg.min.js` 脚本。
+     - 补齐 `ffmpeg.min.js` 运行所需的 core/wasm/worker/chunk 文件到 `vendor/`。
+  2) 在 `src/js/app.js` 新增 ffmpeg 兜底模块：
+     - `canUseFfmpegWasm()`：运行时能力判定；
+     - `getFfmpegInstance()`：按需加载，失败时降级；
+     - `stripMp4AudioTrackWithFfmpeg()`：执行 `-an` 去音轨并返回无音轨 MP4；
+     - `ffmpegRunQueue`：串行化任务，避免并发运行冲突。
+  3) 回退链路接入策略：
+     - `stripMp4AudioTrack()` 改为 `mp4box -> legacy -> ffmpeg`（仅 A 失败后触发 B）。
+     - `openLiveVideoInline().fallbackToStripped()` 中增加“sanitized 播放失败后触发 ffmpeg 二次兜底”分支，避免 A 产物不可播时直接失败。
+  4) 日志可观测性：
+     - 新增 `[ffmpeg-fallback]` 前缀日志（load/strip/fail/success/trigger）。
+- 验证证据：
+  - 语法检查通过：`node --check src/js/app.js`
+  - 关键检索命中：
+    - `index.html` 已包含 `vendor/ffmpeg.min.js`
+    - `src/js/app.js` 已包含 `[ffmpeg-fallback]` 与 `stripMp4AudioTrackWithFfmpeg` 实现
+  - 依赖文件已落地：`vendor/ffmpeg-core.wasm` 等 5 个 ffmpeg 运行文件。
+- 结果状态：
+  - `TASK-LIVE-B-007`：`待确认`（待实机回归验证）。
+- 下一步：
+  1) 你在 Android Edge/Chrome 复测 vivo/honor/xiaomi：
+     - 观察是否仅在 A 失败后出现 `[ffmpeg-fallback]`；
+     - 观察最终是否可形成 `loadedmetadata/canplay/live ended` 闭环；
+     - 回传失败样本日志（若有）。
+
+## 2026-02-17（TASK-LIVE-B-007 补充：基于日志3加临时B链路选择器）
+- 背景：
+  - 用户指定 `docs/temp.md` 的“日志3 安卓端”为最新证据，并要求可手动强制走 B 链路做兼容性对照。
+  - 从该日志可见：多数回放仍走 `sourceMode=original/stripped` 的 A 路径，未出现 `[ffmpeg-fallback]` 触发证据。
+- 改动文件：
+  - `index.html`
+  - `src/js/app.js`
+  - `task.md`
+- 改动点：
+  1) 新增临时选择器：
+     - `index.html` 工具栏新增 `#playbackPathSelect`。
+     - 选项：`自动（A优先）` / `临时强制B（ffmpeg）`。
+  2) 新增链路模式状态与切换逻辑：
+     - `state.livePathMode` + `getLivePathMode()`。
+     - 切换时输出 `[live-path]` 日志，并在正在播放时立即重开当前 Live。
+  3) `openLiveVideoInline()` 支持强制B首源：
+     - 当模式为 `b_force` 时，优先生成/复用 `item._audioStrippedBlobFfmpeg` 并直接作为首源播放；
+     - 若 B 生成失败，自动回退到原自动策略（A 优先）并给出提示。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 代码检索：
+    - `index.html` 已存在 `playbackPathSelect`；
+    - `src/js/app.js` 已存在 `livePathMode`、`[live-path]` 与 `b_force` 分支。
+- 结果状态：
+  - `TASK-LIVE-B-007` 维持 `待确认`（等待你用新选择器做实机回归）。
+- 下一步：
+  1) 你在安卓端将“播放链路”切到“临时强制B（ffmpeg）”，复测 vivo/honor/xiaomi。
+  2) 重点回传是否出现 `[ffmpeg-fallback] strip success` 以及三样本最终播放闭环。
+
+## 2026-02-17（TASK-LIVE-B-007 修复：日志4 Windows 端 B 链路不可用）
+- 背景：
+  - 用户回传 `docs/temp.md` 最新“日志4 widows端”，B 链路不可用。
+  - 关键报错：
+    - `Not allowed to load local resource: file:///home/jeromewu/repos/ffmpeg.wasm/src/browser/vendor/ffmpeg-core.js`
+    - `[ffmpeg-fallback] load failed {message: 'Failed to fetch'}`
+- 根因：
+  - `@ffmpeg/ffmpeg` 对相对 `corePath` 的解析会基于其打包内部基路径（构建机路径），导致请求落到错误的 `file:///...` 地址。
+- 改动文件：
+  - `src/js/app.js`
+  - `task.md`
+- 改动点：
+  1) `getFfmpegInstance()` 中将 `corePath/wasmPath/workerPath` 改为运行时绝对 URL：
+     - `new URL(FFMPEG_*_PATH, window.location.href).toString()`
+  2) 增强日志：
+     - `[ffmpeg-fallback] load start` 现在输出 `coreUrl/wasmUrl/workerUrl`，便于核对实际请求地址。
+- 验证证据：
+  - 语法检查：`node --check src/js/app.js` 通过。
+  - 日志与代码对应：
+    - 原失败点在 `docs/temp.md:1236-1281`
+    - 新实现在 `src/js/app.js` 的 `getFfmpegInstance()`。
+- 结果状态：
+  - `TASK-LIVE-B-007` 维持 `待确认`（等待你在 Windows/Android 再次验证 B 链路）。
+- 下一步：
+  1) Windows Chrome 选择“临时强制B（ffmpeg）”后复测；
+  2) 回传是否出现 `[ffmpeg-fallback] load success` 与 `strip success`。
+
+## 2026-02-17（TASK-LIVE-B-007 修复2：SharedArrayBuffer 限制，切换 core-st）
+- 背景：
+  - 用户回传新报错：`[ffmpeg-fallback] load failed {message: 'SharedArrayBuffer is not defined'}`。
+  - 这说明当前 ffmpeg core 仍是多线程版本（`@ffmpeg/core`），在未启用跨源隔离环境无法运行。
+- 改动文件：
+  - `vendor/ffmpeg-core.js`
+  - `vendor/ffmpeg-core.wasm`
+  - `vendor/ffmpeg-core.worker.js`
+  - `src/js/app.js`
+  - `task.md`
+- 改动点：
+  1) 将 ffmpeg 核心替换为 `@ffmpeg/core-st@0.11.0`（single-thread）：
+     - 覆盖 `vendor/ffmpeg-core.js` 与 `vendor/ffmpeg-core.wasm`。
+  2) 覆盖 `vendor/ffmpeg-core.worker.js` 为 stub（single-thread 构建下不依赖 worker 线程）。
+  3) 增强启动日志：
+     - `[ffmpeg-fallback] load start` 增加 `hasSharedArrayBuffer`，便于确认环境与链路。
+- 验证证据：
+  - `vendor/ffmpeg-core.js` 检索已无 `SharedArrayBuffer/Atomics/pthread` 关键实现。
+  - 语法检查：`node --check src/js/app.js` 通过。
+- 结果状态：
+  - `TASK-LIVE-B-007` 维持 `待确认`（等待你在 Windows 端复测 B 链路）。
+- 下一步：
+  1) 在 Windows Chrome 选“临时强制B（ffmpeg）”复测；
+  2) 回传是否出现：
+     - `[ffmpeg-fallback] load start { ..., hasSharedArrayBuffer: false }`
+     - `[ffmpeg-fallback] load success`
+     - `[ffmpeg-fallback] strip success`。
+
+## 2026-02-18（TASK-LIVE-B-007 收口修复：core-st 启动、并发治理、日志降噪、回归结论）
+- 背景：
+  - Windows Chrome 继续回归时，B 链路出现两类新问题：
+    1) `SharedArrayBuffer` 修复后，仍可能报 `proxy_main` 相关加载失败（core-st 入口不匹配）；
+    2) 快速切图/连续播放时，偶发 `ffmpeg.wasm can only run one command at a time`（busy-stuck）。
+  - 同时日志噪声过高，干扰问题定位；用户要求先降噪再排障。
+- 改动文件：
+  - `src/js/app.js`
+- 改动点：
+  1) core-st 启动链路修复：
+     - `createFFmpeg()` 显式传入 `mainName: 'main'`，匹配 `@ffmpeg/core-st` 导出的 `_main` 入口。
+     - `core/wasm/worker` 资源 URL 增加固定版本参数（`?v=core-st-20260218-1`），避免旧缓存混入。
+  2) B 链路并发与恢复治理：
+     - `runWithBusyRetry()` 增强 busy 退避重试（增加次数和等待）。
+     - 对 `Program terminated with exit(0)` 做“软失败成功”处理：若输出文件已生成则直接判成功。
+     - 新增 `resetFfmpegInstance('busy-stuck')`：检测 busy 卡死后重置实例并自动重试一次。
+     - 在 `b_force` 首次生成 stripped 时增加 `item._audioStrippedBlobFfmpegPromise`，同一文件并发复用，避免重复转码抢占。
+  3) 播放会话一致性修复：
+     - 在 `openLiveVideoInline()` 关键 `await` 之后补充 `playbackToken` 有效性检查，避免旧会话异步结果回写当前视频元素。
+  4) 日志降噪与关键可观测：
+     - 增加 debug 前缀静默机制（默认关闭 `viewer/live-debug/track-probe` 等高频调试输出）。
+     - 保留关键路径日志：`[live-path] mode/open`、`[ffmpeg-fallback]`、错误/告警日志。
+     - 新增运行时开关：`window.__LPV_VERBOSE_DEBUG__ = true/false` 后刷新可切换详细日志。
+  5) B 链路用户行为约束（避免误重试）：
+     - 在 `b_force + stripped` 场景拦截“取消静音重试有声”，并给出可见提示（该链路仅支持静音）。
+     - 仅在当前确为 stripped 时拦截；`auto/original` 不受影响。
+  6) 导航性能微优化：
+     - 去掉 `pointermove` 活动监听，并对导航唤醒逻辑加节流，降低 `handler took ...ms` 违规告警概率。
+  7) Auto 有声链路状态同步：
+     - 保留 `applyVideoAudioState()`（统一同步 `muted/defaultMuted/volume` 与 `muted` 属性），确保 auto 原视频有声播放状态一致。
+  8) 临时诊断变更回收：
+     - 为定位“有波形但无声”曾短暂接入 WebAudio 路由与 `[live-audio]` 诊断日志；
+     - 用户确认根因是本机输出设备切换错误（非代码问题）后，已移除该临时路由与诊断日志，避免引入额外复杂度。
+- 验证证据（用户回归日志）：
+  1) Windows Chrome，`b_force`：
+     - vivo：`load success -> strip success -> [live-path] open mode=b_force sourceMode=stripped`。
+     - 荣耀：`[live-path] open mode=b_force sourceMode=stripped`。
+     - 小米：先 busy 重试，触发 `instance reset {reason:'busy-stuck'}` 后重新 `load success` 并 `strip success`，最终可播。
+  2) Windows Chrome，`auto`：
+     - 全部样本均输出 `mode=auto sourceMode=original muted=false`；
+     - 用户最终确认“无声”由本机音频输出设备误切换导致，非应用链路问题。
+- 结果状态：
+  - `TASK-LIVE-B-007` 技术目标已满足：
+    - B 链路可稳定触发并形成成功输出；
+    - busy-stuck 具备自动恢复能力；
+    - auto 与 b_force 行为边界清晰；
+    - 日志可读性满足后续回归。
+  - 建议将 `TASK-LIVE-B-007` 从 `待确认` 收口为 `完成`，进入 `TASK-LIVE-B-008`（性能与缓存治理）与 `TASK-LIVE-RG-009`（最终验收表）。
+- 下一步：
+  1) 进入 `TASK-LIVE-B-008`：处理转码缓存生命周期、并发上限和快速切图的资源释放策略。
+  2) 进入 `TASK-LIVE-RG-009`：沉淀 Android/Windows 各样本最终验收表并关闭 EPIC。
