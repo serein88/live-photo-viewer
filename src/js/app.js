@@ -85,7 +85,6 @@ const el = {
   filterStill: document.getElementById('filterStill'),
   clearSel: document.getElementById('clearSel'),
   sortSelect: document.getElementById('sortSelect'),
-  playbackPathSelect: document.getElementById('playbackPathSelect'),
   viewerGallery: document.getElementById('viewerGallery'),
 };
 
@@ -214,14 +213,9 @@ function setFilter(f) {
 }
 
 function getLivePathMode() {
-  const raw = el.playbackPathSelect?.value || state.livePathMode || 'auto';
-  return raw === 'b_force' ? 'b_force' : 'auto';
+  return 'auto';
 }
 state.livePathMode = getLivePathMode();
-
-function isForcedBPathMode() {
-  return getLivePathMode() === 'b_force';
-}
 
 function getFileExt(name) {
   if (!name) return '';
@@ -348,6 +342,18 @@ function dropDerivedVideoCaches(items = state.items) {
   }
   derivedVideoCacheRecords.length = 0;
   derivedVideoCacheBytes = 0;
+}
+
+function bindFfmpegDerivedBlob(item, blob) {
+  if (!item || !item.id) return;
+  removeDerivedCacheRecordByKey(`${item.id}:_audioStrippedBlob`);
+  item._audioStrippedBlob = blob || null;
+  if (!blob || !blob.size) {
+    removeDerivedCacheRecordByKey(`${item.id}:_audioStrippedBlobFfmpeg`);
+    item._audioStrippedBlobFfmpeg = null;
+    return;
+  }
+  trackDerivedVideoBlob(item, '_audioStrippedBlobFfmpeg', blob);
 }
 
 function applyVideoAudioState(video, muted) {
@@ -519,19 +525,6 @@ el.clearSel.onclick = () => { state.selection.clear(); renderGrid({ skipGallery:
 el.sortSelect.addEventListener('change', () => {
   renderGrid();
 });
-if (el.playbackPathSelect) {
-  el.playbackPathSelect.addEventListener('change', () => {
-    const mode = getLivePathMode();
-    state.livePathMode = mode;
-    const label = mode === 'b_force' ? '临时强制B链路（ffmpeg）' : '自动链路（A优先）';
-    setStatus(`播放链路已切换：${label}`);
-    console.log('[live-path] mode', { mode });
-    const current = state.viewer && state.filtered ? state.filtered[state.viewer.index] : null;
-    if (current?.isLive && state.livePlaying) {
-      openLiveVideoInline(current);
-    }
-  });
-}
 
 el.filePicker.addEventListener('change', () => {
   handleSelectedFiles(el.filePicker.files || [], 'file');
@@ -1579,13 +1572,6 @@ function updateLiveButton() {
     muteBtn.addEventListener('click', () => {
       const currentItem = state.viewer ? state.filtered[state.viewer.index] : null;
       const nextMuted = !state.liveMuted;
-      const sourceModeNow = currentItem?._lastLiveSourceMode || 'original';
-      if (!nextMuted && isForcedBPathMode() && sourceModeNow === 'stripped') {
-        const text = '当前为B链路（ffmpeg去音轨），仅支持静音播放；请切回“自动（A优先）”后再重试有声。';
-        setStatus(text);
-        showViewerNotice(text, { tone: 'warn', duration: 3000 });
-        return;
-      }
       if (!nextMuted && currentItem?._audioUnsupported) {
         // User explicitly retries audio on a previously degraded item.
         currentItem._audioUnsupported = false;
@@ -1620,11 +1606,9 @@ function updateLiveButton() {
     btn.classList.add('active');
     btn.classList.remove('hidden');
     muteBtn.classList.remove('hidden');
-    const audioBlocked = !!current._audioUnsupported || isForcedBPathMode();
+    const audioBlocked = !!current._audioUnsupported;
     muteBtn.dataset.audioBlocked = audioBlocked ? 'true' : 'false';
-    muteBtn.title = isForcedBPathMode()
-      ? '当前为B链路（ffmpeg去音轨），仅支持静音播放'
-      : (audioBlocked ? '当前文件音频不兼容，已自动切换静音播放' : '静音/取消静音');
+    muteBtn.title = audioBlocked ? '当前文件音频不兼容，已自动切换静音播放' : '静音/取消静音';
   } else {
     btn.classList.remove('active');
     btn.classList.add('hidden');
@@ -1649,31 +1633,6 @@ async function openLiveVideoInline(item) {
   let blobToPlay = item.videoBlob;
   let sourceMode = 'original';
   let effectiveMuted = state.liveMuted;
-  if (livePathMode === 'b_force' && item.videoBlob) {
-    let forcedBBlob = item._audioStrippedBlobFfmpeg || null;
-    if (!forcedBBlob) {
-      if (!item._audioStrippedBlobFfmpegPromise) {
-        item._audioStrippedBlobFfmpegPromise = stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name)
-          .finally(() => { item._audioStrippedBlobFfmpegPromise = null; });
-      }
-      forcedBBlob = await item._audioStrippedBlobFfmpegPromise;
-      if (!isCurrentPlayback()) return;
-      if (forcedBBlob) trackDerivedVideoBlob(item, '_audioStrippedBlobFfmpeg', forcedBBlob);
-    }
-    if (forcedBBlob) {
-      item._audioStrippedBlob = forcedBBlob;
-      item._audioUnsupported = true;
-      blobToPlay = forcedBBlob;
-      sourceMode = 'stripped';
-      effectiveMuted = true;
-      state.liveMuted = true;
-      showViewerNotice('临时测试：已强制使用B链路（ffmpeg）', { duration: 1800 });
-      setStatus('当前为B链路（ffmpeg去音轨），仅支持静音播放');
-    } else {
-      console.warn('[live-path] b_force unavailable; fallback auto', { name: item.name });
-      showViewerNotice('B链路不可用，已回退自动链路', { tone: 'warn', duration: 2400 });
-    }
-  }
   if (!isCurrentPlayback()) return;
   if (sourceMode === 'original') {
     const preferSanitized = !!(state.liveMuted && item._audioUnsupported && item._audioStrippedBlob);
@@ -1714,47 +1673,41 @@ async function openLiveVideoInline(item) {
     canPlayQuickTime: video.canPlayType('video/quicktime')
   });
   let fallbackPromise = null;
-  let fallbackAttempted = blobToPlay !== item.videoBlob;
   let usingStrippedSource = blobToPlay !== item.videoBlob;
+  let usingFfmpegSource = !!(
+    usingStrippedSource
+    && item._audioStrippedBlobFfmpeg
+    && blobToPlay === item._audioStrippedBlobFfmpeg
+  );
   const fallbackToStripped = async (reason) => {
     if (!isCurrentPlayback()) return false;
     if (fallbackPromise) {
       console.debug('[live-debug] fallback join', { name: item.name, reason });
       return await fallbackPromise;
     }
-    if (usingStrippedSource) {
+    if (usingFfmpegSource) {
       console.debug('[live-debug] fallback skipped', {
         name: item.name,
         reason,
-        why: 'already-stripped'
-      });
-      return true;
-    }
-    if (fallbackAttempted) {
-      console.debug('[live-debug] fallback skipped', {
-        name: item.name,
-        reason,
-        why: 'already-attempted'
+        why: 'already-b-chain'
       });
       return false;
     }
-    fallbackAttempted = true;
     if (fallbackPromise) return fallbackPromise;
     fallbackPromise = (async () => {
       if (!isCurrentPlayback()) return false;
-      let stripped = item._audioStrippedBlob || null;
-      if (!stripped) {
-        stripped = await stripMp4AudioTrack(item.videoBlob, { itemName: item.name });
-        if (stripped) {
+      let stripped = usingStrippedSource ? item._audioStrippedBlob : (item._audioStrippedBlob || null);
+      if (!usingStrippedSource && !stripped) {
+        stripped = await stripMp4AudioTrack(item.videoBlob, { itemName: item.name, allowFfmpeg: false });
+        if (stripped && isCurrentPlayback()) {
           console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
           trackDerivedVideoBlob(item, '_audioStrippedBlob', stripped);
         } else {
           console.debug('[live-debug] strip audio skipped', { name: item.name, reason });
         }
-      } else {
+      } else if (stripped) {
         console.debug('[live-debug] use cached stripped', { name: item.name, reason, sourceMode });
       }
-      if (!isCurrentPlayback() || !stripped) return false;
       const applyMutedUiState = () => {
         usingStrippedSource = true;
         item._audioUnsupported = true;
@@ -1791,6 +1744,7 @@ async function openLiveVideoInline(item) {
         try {
           await video.play();
           if (!isCurrentPlayback()) return false;
+          usingFfmpegSource = sourceTag === 'ffmpeg';
           if (state.viewer) updateLiveButton();
           return true;
         } catch (retryErr) {
@@ -1803,17 +1757,35 @@ async function openLiveVideoInline(item) {
           return false;
         }
       };
-      let played = await playSanitizedBlob(stripped, 'a-chain');
-      if (played) return true;
+      if (stripped) {
+        const played = await playSanitizedBlob(stripped, 'a-chain');
+        if (played) return true;
+      }
       if (!isCurrentPlayback()) return false;
-      console.warn('[ffmpeg-fallback] trigger after sanitized play failed', { name: item.name, reason });
-      const ffmpegStripped = await stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name);
+      if (usingFfmpegSource) return false;
+      console.warn('[ffmpeg-fallback] trigger auto-b', { name: item.name, reason, from: usingStrippedSource ? 'a-stripped' : 'original' });
+      let ffmpegStripped = item._audioStrippedBlobFfmpeg || null;
+      if (!ffmpegStripped) {
+        if (!item._audioStrippedBlobFfmpegPromise) {
+          item._audioStrippedBlobFfmpegPromise = stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name)
+            .finally(() => { item._audioStrippedBlobFfmpegPromise = null; });
+        }
+        ffmpegStripped = await item._audioStrippedBlobFfmpegPromise;
+        if (ffmpegStripped && isCurrentPlayback()) {
+          bindFfmpegDerivedBlob(item, ffmpegStripped);
+        }
+      }
       if (!ffmpegStripped || !isCurrentPlayback()) return false;
-      trackDerivedVideoBlob(item, '_audioStrippedBlob', ffmpegStripped);
-      played = await playSanitizedBlob(ffmpegStripped, 'ffmpeg', true);
-      return played;
+      return await playSanitizedBlob(ffmpegStripped, 'ffmpeg', true);
     })();
-    return await fallbackPromise;
+    const pending = fallbackPromise;
+    try {
+      return await pending;
+    } finally {
+      if (fallbackPromise === pending) {
+        fallbackPromise = null;
+      }
+    }
   };
   const initialTrackInfo = await detectTracksForPlayback(blobToPlay, item.name, sourceMode, item);
   if (!isCurrentPlayback()) return;
@@ -1862,8 +1834,9 @@ async function openLiveVideoInline(item) {
       message: mediaError?.message || '(no-message)'
     });
     const message = mediaError?.message || '';
-    const shouldFallbackToStripped = !usingStrippedSource && (
-      mediaError?.code === 4
+    const shouldFallbackToStripped = !usingFfmpegSource && (
+      usingStrippedSource
+      || mediaError?.code === 4
       || /AAC|DEMUXER_ERROR|supported source|not supported|decode/i.test(message)
       || (!!initialTrackInfo?.audio && !state.liveMuted)
     );
@@ -2886,7 +2859,7 @@ async function stripMp4AudioTrackLegacy(blob) {
 }
 
 async function stripMp4AudioTrack(blob, options = {}) {
-  const { itemName = '' } = options;
+  const { itemName = '', allowFfmpeg = true } = options;
   console.log('[mp4box] strip request', { size: blob?.size || 0, type: blob?.type || '', itemName });
   const mp4boxResult = await stripMp4AudioTrackWithMp4Box(blob);
   if (mp4boxResult) {
@@ -2899,6 +2872,7 @@ async function stripMp4AudioTrack(blob, options = {}) {
     console.log('[mp4box] strip success legacy', { before: blob?.size || 0, after: legacyResult.size });
     return legacyResult;
   }
+  if (!allowFfmpeg) return null;
   console.warn('[mp4box] strip fallback ffmpeg');
   return await stripMp4AudioTrackWithFfmpeg(blob, itemName);
 }

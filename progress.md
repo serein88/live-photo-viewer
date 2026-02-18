@@ -710,3 +710,306 @@
 - 下一步：
   1) 进入 `TASK-LIVE-B-008`：处理转码缓存生命周期、并发上限和快速切图的资源释放策略。
   2) 进入 `TASK-LIVE-RG-009`：沉淀 Android/Windows 各样本最终验收表并关闭 EPIC。
+
+## 2026-02-18（状态落盘：TASK-LIVE-B-007 完成 + TASK-LIVE-B-008 启动）
+- 背景：
+  - 用户明确确认：`TASK-LIVE-B-007` 完成，并要求继续下一步。
+  - 同轮确认“auto 无声”是本机音频输出设备切换造成的乌龙，不属于代码缺陷。
+- 改动文件：
+  - `task.md`
+  - `src/js/app.js`
+- 状态更新：
+  1) `TASK-LIVE-B-007`：从 `待确认` 调整为 `完成`。
+  2) `TASK-LIVE-B-008`：从 `待进行` 调整为 `进行中`。
+- B-008 首轮实施（缓存治理起步）：
+  1) 新增衍生视频缓存治理参数与账本：
+     - `DERIVED_VIDEO_CACHE_MAX_ITEMS`
+     - `DERIVED_VIDEO_CACHE_MAX_BYTES`
+     - `derivedVideoCacheRecords` / `derivedVideoCacheBytes`
+  2) 新增统一管理函数：
+     - `trackDerivedVideoBlob(item, field, blob)`（记录与触摸缓存）
+     - `evictDerivedVideoCacheIfNeeded()`（超量时按 LRU 回收，当前播放项优先保留）
+     - `dropDerivedVideoCaches(items)`（导入新文件集前清理衍生缓存）
+  3) 将 B 链路衍生产物接入缓存治理：
+     - `item._audioStrippedBlob`
+     - `item._audioStrippedBlobFfmpeg`
+  4) 在扫描入口统一清理旧缓存，避免跨目录累积：
+     - `startScan()`
+     - `startScanOverride()`
+- 验证证据：
+  - 语法检查通过：`node --check src/js/app.js`。
+  - 关键检索命中：
+    - 缓存治理函数与常量已落地；
+    - 扫描入口已调用 `dropDerivedVideoCaches(...)`；
+    - B 链路赋值点已接入 `trackDerivedVideoBlob(...)`。
+- 当前结论：
+  - `TASK-LIVE-B-007` 已完成并完成文档落盘。
+  - `TASK-LIVE-B-008` 已进入实现阶段（第一批缓存治理已上线），后续继续推进“资源释放策略 + 回归指标”。
+
+## 2026-02-18（状态落盘：TASK-LIVE-B-008 完成 + 新增 TASK-LIVE-B-010）
+- 背景：
+  - 用户确认可基于自动化测试结果收口 `TASK-LIVE-B-008`，并要求新增子任务处理“`A` 链路失败后不会自动切 `B`”的问题。
+  - 本轮自动化测试样本目录：`E:\CodeSpace\live-photo-viewer\test`（14 文件，12 Live）。
+- 自动化验收摘要（Windows Chrome + MCP）：
+  1) `b_force` 链路：
+     - 三厂商样本可稳定 `sourceMode=stripped`；
+     - 同文件重复打开不重复 strip（命中 `_audioStrippedBlobFfmpeg` 缓存）；
+     - 并发双开同一文件仅 1 次 `strip request`（Promise 复用生效）。
+  2) 缓存治理：
+     - `DERIVED_VIDEO_CACHE_MAX_ITEMS` 与 `DERIVED_VIDEO_CACHE_MAX_BYTES` 上限生效；
+     - LRU 回收生效；
+     - 重扫入口会清理衍生缓存（`len=0, bytes=0`）。
+  3) 首帧体验：
+     - 同文件冷启动到 `canplay` 约 1.4s，缓存命中后约 0.08s，缓存收益明显。
+- 改动文件：
+  - `task.md`
+- 状态更新：
+  1) `TASK-LIVE-B-008`：从 `进行中` 调整为 `完成`。
+  2) 新增 `TASK-LIVE-B-010`（`P0`，`待进行`）：
+     - 任务名：`B3：A链路失败自动切换到B链路`
+     - 目标：当 `A` 链路原始源与 sanitized 源均失败时，自动触发 ffmpeg `B` 链路，无需手动切 `b_force`。
+  3) `EPIC-LIVE-ROBUST-001` 验收口径同步加入 `TASK-LIVE-B-010`。
+- 下一步：
+  1) 进入 `TASK-LIVE-B-010` 实现自动回退闭环（含防抖与并发保护）。
+  2) 完成后进入 `TASK-LIVE-RG-009` 做 Android/Windows 最终回归验收表。
+
+## 2026-02-18（TASK-LIVE-B-010 首版实现：A失败自动切B）
+- 背景：
+  - 用户要求按计划进入 `TASK-LIVE-B-010`，修复“`A` 链路失败时不会自动切 `B`”。
+- 改动文件：
+  - `src/js/app.js`
+  - `task.md`
+- 核心改动：
+  1) 在播放回退链路中引入明确的 `A -> B` 收敛逻辑：
+     - 修复旧逻辑中“已是 stripped 即视为回退成功”的误判；
+     - 新增 `usingFfmpegSource` 判定，只有“已在 B 源”才终止回退。
+  2) 回退阶段拆分：
+     - A 阶段仅尝试 `mp4box + legacy`（`allowFfmpeg: false`）；
+     - A 失败后统一进入 ffmpeg B 阶段（`trigger auto-b`），避免分散触发点。
+  3) ffmpeg 产物统一绑定：
+     - 新增 `bindFfmpegDerivedBlob(item, blob)`；
+     - 自动 B 回退成功后写入 `_audioStrippedBlobFfmpeg`，并同步 `_audioStrippedBlob` 引用，保证后续复用与缓存账本一致。
+  4) 错误分支修复：
+     - `video.onerror` 在“当前为 A-stripped 且未到 B”时也允许继续触发回退，避免直接中断播放。
+- 自动化验证（Windows Chrome + MCP）：
+  1) 用例1：`original` 首次 `play reject` + A-stripped 人工注入失败：
+     - 命中 `[ffmpeg-fallback] trigger auto-b`；
+     - 命中 `strip request/success`；
+     - 最终 `item._audioStrippedBlobFfmpeg` 存在。
+  2) 用例2：直接从 `A-stripped` 启动并注入失败：
+     - 仍命中 `trigger auto-b` + `strip request/success`；
+     - 证明“stripped 失败继续切 B”生效。
+  3) 回归：
+     - `auto` 正常样本仍走 `sourceMode=original`，不误触发 ffmpeg；
+     - `b_force` 仍走 `sourceMode=stripped`（静音）不回归。
+- 状态更新：
+  - `TASK-LIVE-B-010`：`待进行 -> 进行中`（首版实现完成，待 Android 实机回归收口）。
+- 下一步：
+  1) 在 Android 实机（Chrome/Edge）按样本跑 B-010 回归，确认同样可自动触发 `trigger auto-b`。
+  2) 回归通过后将 `TASK-LIVE-B-010` 置为 `待确认`，再进入 `TASK-LIVE-RG-009` 总验收。
+
+## 2026-02-18（TASK-LIVE-B-010 安卓实机自动回归：Chrome 通过）
+- 背景：
+  - 用户已连接安卓手机（USB 调试 + ADB），要求直接开始实机自动调试。
+- 调试链路：
+  1) 设备与端口：
+     - `adb devices -l` 识别设备：`23c6333f`（model `22081212C`）。
+     - `adb reverse tcp:8080 tcp:8080` 成功（手机可访问本机服务）。
+     - 本机 `9222` 被占用，改用 `adb forward tcp:9322 localabstract:chrome_devtools_remote`。
+  2) 目标确认：
+     - `http://127.0.0.1:9322/json/version` 显示 `Android-Package: com.android.chrome`。
+     - `http://127.0.0.1:9322/json/list` 命中页面：`http://localhost:8080/live-photo-viewer/`。
+  3) 自动化执行方式：
+     - 通过 CDP（WebSocket）执行 `Runtime.evaluate`，在手机页面内直接拉取 `test/` 样本 URL 并构造 `File`，调用 `handleSelectedFiles(...)` 完成导入。
+- 回归结果（Android Chrome）：
+  1) 样本导入：
+     - `files=14`，`items=14`，`live=12`。
+  2) 用例1（`original` 失败 -> 自动切 B）：
+     - `triggerAutoB=1`；
+     - `stripReq=2`，`stripSucc=1`；
+     - `_audioStrippedBlobFfmpeg` 已生成（`5636723` bytes）；
+     - 结论：通过。
+  3) 用例2（`A-stripped` 失败 -> 自动切 B）：
+     - `triggerAutoB=1`；
+     - `stripReq=1`，`stripSucc=1`；
+     - `_audioStrippedBlobFfmpeg` 已生成（`5636723` bytes）；
+     - 结论：通过。
+  4) 回归检查（不误触发）：
+     - `auto` 正常样本（`vivo-live-3.jpg`）输出 `sourceMode=original`，`stripReq=0`；
+     - 结论：通过。
+- 当前结论：
+  - `TASK-LIVE-B-010` 的核心目标在 Android Chrome 已复现通过（A 失败可自动切 B，且正常 auto 不误触发）。
+  - 仍建议补一轮 Android Edge 后再把 `TASK-LIVE-B-010` 从 `进行中` 收口到 `待确认`。
+
+## 2026-02-18（TASK-LIVE-B-010 安卓实机自动回归：Edge 通过）
+- 背景：
+  - 用户已切到 Android Edge 并要求继续自动调试。
+- 调试链路：
+  1) 端口绑定：
+     - 设备中 Chrome 与 Edge 同时运行；
+     - 从 `/proc/net/unix` 定位到 Edge socket：`@chrome_devtools_remote_25392`；
+     - 绑定：`adb forward tcp:9322 localabstract:chrome_devtools_remote_25392`。
+  2) 目标确认：
+     - `json/version` 显示 `Android-Package: com.microsoft.emmx`（`EdgA/144.0.3719.115`）。
+     - `json/list` 命中页面：`http://localhost:8080/live-photo-viewer/`。
+- 自动化结果（Android Edge）：
+  1) 用例1：`original` 失败 -> 自动切 B：
+     - `trigger auto-b=1`，`strip request=1`，`strip success=1`，通过。
+  2) 用例2：`A-stripped` 失败 -> 自动切 B：
+     - `trigger auto-b=1`，`strip request>=1`，`strip success=1`，通过。
+  3) 回归项：`auto` 正常样本不误触发 ffmpeg：
+     - `sourceMode=original`，`strip request=0`，通过。
+  4) 结束态恢复：
+     - 页面恢复 `mode=auto`、`liveMuted=false`。
+- 状态更新：
+  - `TASK-LIVE-B-010`：由 `进行中` 调整为 `待确认`（Windows + Android Chrome/Edge 自动化均已通过，待用户手工验收）。
+
+## 2026-02-18（状态落盘：TASK-LIVE-B-010 完成）
+- 背景：
+  - 用户明确确认：`TASK-LIVE-B-010` 完成。
+- 状态更新：
+  1) `task.md` 中 `TASK-LIVE-B-010` 从任务队列移入“完成”分区。
+  2) 备注更新为“Windows + Android Chrome/Edge 自动化回归通过，用户手工验收确认完成”。
+- 补充说明（本轮问答）：
+  1) 本次自动化脚本在安卓端使用的是页面内 `fetch('/live-photo-viewer/test/...')` 构造的 `File`，来源是本机服务映射到手机，并非直接读取你手机目录 `根目录/111我的文件/live-photo-test/`。
+  2) 关于“安卓 Edge 看起来无法走 A 链路”：自动化里可观测到至少部分样本能以 `sourceMode=original` 打开且 `strip request=0`；但在真实本地文件路径场景下，A 链路可能快速失败并自动切 B，体感上会像“不能走 A”。
+
+## 2026-02-18（安卓本地目录直读验证：Edge）
+- 背景：
+  - 用户要求验证“直接读取手机本地目录”能力，目标目录：
+    - `/storage/emulated/0/111我的文件/live-photo-test/`
+- 验证方式：
+  1) 通过 ADB 确认目录与文件：
+     - 目录存在，文件数 `14`（与电脑样本一致）。
+  2) 通过 CDP `DOM.setFileInputFiles` 将上述目录 14 个文件路径直接注入页面 `#mcpFiles`，触发 `change`。
+- 结果：
+  1) 本地目录导入成功：
+     - `picked=14`，`state.files=14`，`state.items=14`，`live=12`，状态 `Scan complete`。
+  2) Android Edge 在本地目录数据下的链路行为（`auto`）：
+     - 12/12 Live 初始 `open` 均显示 `sourceMode=original`；
+     - 但最终 `lastSource` 全部变为 `stripped`；
+     - 全部触发 `mp4box strip request`（12/12）；
+     - `ffmpeg` 未触发（`trigger auto-b=0`，`strip request=0`）。
+- 结论：
+  - “直接读取安卓本地目录”在当前页面可行（已验证）。
+  - 你观察到的“安卓 Edge A 链路基本不可用”在该目录样本上被证实：
+    - A-original 启动后会统一降级到 A-stripped（静音），未进入 B-ffmpeg。
+
+## 2026-02-18（TASK-LIVE-RG-009 启动：首版多浏览器验收矩阵）
+- 背景：
+  - `TASK-LIVE-B-010` 已完成，进入 `TASK-LIVE-RG-009`（主线最终回归清单）。
+- 状态更新：
+  - `TASK-LIVE-RG-009`：`待进行 -> 进行中`。
+- 首版验收矩阵（3 厂商样本：vivo/荣耀/xiaomi）：
+  - Windows Chrome（本轮实测，样本：`*-live-1.jpg`）：
+    - 三样本均 `open sourceMode=original`；
+    - `mp4box/ffmpeg` 均未触发；
+    - `finalSource=original`（有声主链路保持）。
+  - Android Chrome（沿用本轮前序自动化证据）：
+    - B-010 自动回退用例通过（original 失败可自动切 B；A-stripped 失败可自动切 B）；
+    - 回归项显示 `auto` 正常样本可 `sourceMode=original` 且不误触发 ffmpeg。
+  - Android Edge（本轮“手机本地目录直读”实测，目录 `/storage/emulated/0/111我的文件/live-photo-test/`）：
+    - 本地目录导入成功（`files=14`, `items=14`, `live=12`）；
+    - 12/12 Live 初始 `open sourceMode=original`，但最终均降级到 `finalSource=stripped`；
+    - 触发路径为 `mp4box`，未触发 ffmpeg。
+- 当前结论：
+  - Android/Windows 的核心链路均可形成“可播放闭环”（含降级路径），并有可复现脚本证据。
+  - 现有环境下缺少 Windows Edge 本机可执行通道（未检测到本机 Edge 调试入口）；是否补此项由你确认。
+- 下一步：
+  1) 若你要求严格覆盖“Windows 主流浏览器=Chrome+Edge”，需在可调试的 Windows Edge 环境补一轮 3 厂商样本。
+  2) 若认可当前覆盖口径，可将 `TASK-LIVE-RG-009` 提交 `待确认`，并把 `EPIC-LIVE-ROBUST-001` 置为 `待确认`。
+
+## 2026-02-18（TASK-LIVE-RG-009 补测：Windows Edge 三厂商样本）
+- 背景：
+  - 用户要求“继续调试并推进 `TASK-LIVE-RG-009` 可完成”。
+  - 首版矩阵缺口为 Windows Edge 样本。
+- 调试链路：
+  1) 发现本机 Edge 可执行路径：
+     - `C:\Program Files (x86)\Microsoft\EdgeCore\136.0.3240.92\msedge.exe`
+  2) 启动远程调试：
+     - `--remote-debugging-port=9333`
+     - `json/version` 确认：`Edg/136.0.3240.92`（Windows）。
+  3) 样本导入策略：
+     - 直接注入中文路径会导致对应文件在 Edge 变为 `size=0`（中文路径编码问题）；
+     - 采用 ASCII 临时样本目录（同内容拷贝）完成三厂商回归：
+       - `vivo-live-1.jpg`
+       - `xiaomi-live-1.jpg`
+       - `honor-live-1.jpg`（来自 `荣耀-live-1.jpg` 的同内容拷贝，SHA256 一致）。
+- 回归结果（Windows Edge）：
+  1) 导入：`files=3`，`items=3`，`live=3`。
+  2) 三厂商链路：
+     - 全部 `open sourceMode=original`；
+     - `mp4box/ffmpeg` 均未触发；
+     - `finalSource=original`（A 主链路可用）。
+  3) 厂商识别：
+     - `vivo Live Photo` / `Xiaomi Live Photo` / `HONOR Live Photo` 均识别成功。
+- 状态更新：
+  - `TASK-LIVE-RG-009`：`进行中 -> 待确认`（可复现验收矩阵已覆盖 Android/Windows 主流浏览器与三厂商样本）。
+
+## 2026-02-18（TASK-LIVE-RG-009 收口复核：无剩余未调试项）
+- 背景：
+  - 用户要求继续排查“当前进行中的子任务还剩哪些未调试”，并确认 `TASK-LIVE-RG-009` 是否可收口。
+- 复核动作：
+  1) Windows 端页面日志抽检（MCP）：
+     - 抽取 `live-path open` 最新日志，三厂商样本均为：
+       - `mode=auto`
+       - `sourceMode=original`
+       - `audioUnsupported=false`
+     - 未见新的 `mp4box/ffmpeg` 误触发证据。
+  2) Android Edge 通道体检（ADB）：
+     - `adb devices -l` 设备在线；
+     - `adb reverse tcp:8080 tcp:8080` 正常；
+     - `adb forward tcp:9322 localabstract:chrome_devtools_remote_25392` 正常；
+     - `json/version` 命中 `Android-Package: com.microsoft.emmx`；
+     - `json/list` 命中目标页 `http://localhost:8080/live-photo-viewer/`。
+- 结果结论：
+  - 对 `TASK-LIVE-RG-009` 当前口径（Android/Windows 主流浏览器 + 三厂商样本）已无新增未调试缺口。
+  - 任务状态维持 `待确认`，具备直接验收并转 `完成` 的条件。
+
+## 2026-02-18（TASK-LIVE-RG-009 用户确认完成）
+- 背景：
+  - 用户明确回复“`TASK-LIVE-RG-009`确认完成”。
+- 改动：
+  1) `task.md`：
+     - `TASK-LIVE-RG-009` 从“待确认”移动到“完成”分区。
+     - “待确认”分区清空为“暂无”。
+- 验证证据：
+  - 状态变更已落盘，`task.md` 中可见 `TASK-LIVE-RG-009 | 完成`。
+- 结果状态：
+  - `TASK-LIVE-RG-009`：`待确认 -> 完成`。
+- 下一步：
+  - 可继续按优先级执行下一任务（当前 `EPIC-LIVE-ROBUST-001` 已满足子任务通过条件，可在你确认后进入总任务收口流程）。
+
+## 2026-02-18（EPIC-LIVE-ROBUST-001 用户确认完成）
+- 背景：
+  - 用户明确回复“`EPIC-LIVE-ROBUST-001`确认完成”。
+- 改动：
+  1) `task.md`：
+     - `EPIC-LIVE-ROBUST-001` 从“进行中”移动到“完成”分区。
+     - “进行中”分区清空为“暂无”。
+- 验证证据：
+  - `task.md` 中可见 `EPIC-LIVE-ROBUST-001 | 完成`。
+- 结果状态：
+  - `EPIC-LIVE-ROBUST-001`：`进行中 -> 完成`。
+- 下一步：
+  - 主线已收口，可按优先级进入下一任务（建议从 `TASK-PERF-CACHE-101` 开始）。
+
+## 2026-02-18（临时调试入口回滚：播放链路选择器下线）
+- 背景：
+  - 用户要求将临时内容改回正式形态，重点包含“播放链路选择按钮”。
+- 改动：
+  1) `index.html`：
+     - 移除工具栏中的“播放链路”下拉（`#playbackPathSelect`）。
+  2) `src/js/app.js`：
+     - `getLivePathMode()` 固定返回 `auto`。
+     - 移除 `#playbackPathSelect` 的 DOM 引用与 `change` 监听。
+     - 移除“强制 B 链路”相关的前台提示分支与按钮文案分支。
+     - `openLiveVideoInline()` 删除 `b_force` 人工强制分支，保留自动链路与失败回退能力。
+- 验证证据：
+  - 语法检查通过：`node --check src/js/app.js`。
+  - 页面快照验证：工具栏仅保留排序控件，无“播放链路”选择器。
+  - 页面脚本验证：`document.getElementById('playbackPathSelect') === null` 且 `getLivePathMode() === 'auto'`。
+- 结果状态：
+  - 临时播放链路手动切换入口已下线，页面恢复正式默认链路行为。
+- 下一步：
+  - 若你还要继续清理其它临时项（如调试日志前缀、MCP 专用提示文案），可按同口径逐项回滚。

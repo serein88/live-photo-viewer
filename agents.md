@@ -58,3 +58,34 @@
   - 在 `chrome://inspect/#devices` 可看到设备 `V2502A / com.microsoft.emmx` 与 `Live 图查看器 (http://localhost:8080/)`。
   - 若出现 `Remote browser is newer than client browser`，优先尝试 `inspect fallback`。
   - 远程页面容易断连，调试时需保持手机端目标页在前台。
+
+### Android USB 实机调试 SOP（Chrome / Edge，已验证）
+- 前置条件：
+  - 手机开启 USB 调试，`adb devices -l` 可见 `device`。
+  - 本机服务已启动（示例：`http://localhost:8080/live-photo-viewer/`）。
+- 必做端口映射：
+  1. `adb reverse tcp:8080 tcp:8080`（让手机访问本机服务）。
+  2. 远程调试端口优先用 `9322`，避免与本机 `9222` 冲突：
+     - Chrome：`adb forward tcp:9322 localabstract:chrome_devtools_remote`
+     - Edge（推荐）：先定位 socket，再绑定：
+       - `adb shell cat /proc/net/unix | findstr /i devtools`
+       - 找到类似 `@chrome_devtools_remote_<pid>`（本次为 `@chrome_devtools_remote_25392`）
+       - `adb forward tcp:9322 localabstract:chrome_devtools_remote_25392`
+- 目标确认（必须做）：
+  - `Invoke-WebRequest http://127.0.0.1:9322/json/version`：
+    - `Android-Package: com.android.chrome` 表示 Chrome；
+    - `Android-Package: com.microsoft.emmx` 表示 Edge。
+  - `Invoke-WebRequest http://127.0.0.1:9322/json/list` 确认目标页是 `http://localhost:8080/live-photo-viewer/`。
+- 自动化执行策略（CDP）：
+  - 优先使用 `Runtime.evaluate` 在手机页面内执行脚本（可稳定验证链路状态与日志）。
+  - `Runtime.evaluate` 建议传 `awaitPromise=true`、`returnByValue=true`，播放相关用例建议 `userGesture=true`，减少自动播放策略干扰。
+  - 导入样本有两种方式：
+    1. 页面已有文件时直接复用；
+    2. 在页面内 `fetch('/live-photo-viewer/test/...')` 构造 `File` 后调用 `handleSelectedFiles(...)`。
+  - 注意：第 2 种并非“直接读取手机本地目录文件”，而是读取本机服务映射到手机的样本资源。
+- 常见问题与处理：
+  - `9222` 被占用：不要抢占，直接改用 `9322` 并重绑 `adb forward`。
+  - Chrome 与 Edge 同时开：`chrome_devtools_remote` 可能不稳定，优先按 `/proc/net/unix` 绑定到指定 `@chrome_devtools_remote_<pid>`。
+  - 若无法通过命令自动打开手机页面（命令被策略拦截），让用户手动在手机浏览器打开目标 URL 后继续自动化。
+- 会话结束建议：
+  - 把页面恢复到 `mode=auto`、`liveMuted=false`，避免影响下一轮人工验收。
