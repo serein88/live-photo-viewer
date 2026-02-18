@@ -28,6 +28,33 @@ const FFMPEG_ASSET_VERSION = 'core-st-20260218-1';
 const ENABLE_VERBOSE_DEBUG_LOGS = typeof window !== 'undefined' && !!window.__LPV_VERBOSE_DEBUG__;
 const DERIVED_VIDEO_CACHE_MAX_ITEMS = 24;
 const DERIVED_VIDEO_CACHE_MAX_BYTES = 220 * 1024 * 1024;
+const SCAN_RESULT_CACHE_MAX_ITEMS = 6000;
+const SCAN_RESULT_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const SCAN_RESULT_CACHE_STORAGE_KEY = 'lpv.scan-cache.v2';
+const SCAN_RESULT_CACHE_STORAGE_VERSION = 2;
+const SCAN_RESULT_CACHE_PERSIST_MAX_ITEMS = 2500;
+const SCAN_RESULT_CACHE_PERSIST_MAX_BYTES = 3 * 1024 * 1024;
+const THUMB_CACHE_DB_NAME = 'lpv-thumb-cache';
+const THUMB_CACHE_DB_VERSION = 2;
+const THUMB_CACHE_STORE = 'thumbs';
+const THUMB_CACHE_MAX_ITEMS = 12000;
+const THUMB_CACHE_MAX_BYTES = 320 * 1024 * 1024;
+const FINGERPRINT_SIG_BYTES = 4096;
+const CACHE_EXIF_KEYS = Object.freeze([
+  'DateTimeOriginal',
+  'DateTime',
+  'Model',
+  'Make',
+  'LensModel',
+  'ImageWidth',
+  'ImageHeight',
+  'GPSLatitude',
+  'GPSLongitude',
+  'GPSLatitudeRef',
+  'GPSLongitudeRef',
+  'latitude',
+  'longitude',
+]);
 const MUTED_DEBUG_PREFIXES = Object.freeze([
   '[viewer]',
   '[viewer-nav]',
@@ -67,6 +94,15 @@ let ffmpegRunQueue = Promise.resolve();
 let ffmpegUnavailableLogged = false;
 let derivedVideoCacheBytes = 0;
 const derivedVideoCacheRecords = [];
+let scanResultCacheBytes = 0;
+const scanResultCache = new Map();
+let scanResultCachePersistTimer = null;
+let scanResultCacheLoaded = false;
+let thumbCacheDbPromise = null;
+let thumbCacheTrimTimer = null;
+let thumbCacheDisabled = false;
+const thumbCacheReadInFlight = new Map();
+const thumbCacheWriteInFlight = new Map();
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
 const VIDEO_EXTS = new Set(['mp4','mov','m4v','3gp','webm','mkv','avi']);
@@ -149,6 +185,14 @@ window.addEventListener('resize', () => {
     const panel = document.querySelector('.viewer-panel');
     const open = !!(panel && !panel.classList.contains('hidden'));
     syncPanelState(open);
+  }
+});
+window.addEventListener('beforeunload', () => {
+  persistScanResultCacheNow();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    persistScanResultCacheNow();
   }
 });
 applyLayout('auto');
@@ -354,6 +398,545 @@ function bindFfmpegDerivedBlob(item, blob) {
     return;
   }
   trackDerivedVideoBlob(item, '_audioStrippedBlobFfmpeg', blob);
+}
+
+function normalizePathHintForFingerprint(file) {
+  const rawPath = String(file?.webkitRelativePath || '').trim();
+  const rawName = String(file?.name || '').trim();
+  const pathHint = rawPath || rawName || '(unknown)';
+  return pathHint.replace(/\\/g, '/').toLowerCase();
+}
+
+function getFingerprintBaseKey(file) {
+  const pathHint = normalizePathHintForFingerprint(file);
+  const size = Number(file?.size) || 0;
+  const mtime = Number(file?.lastModified) || 0;
+  return `v2|${pathHint}|${size}|${mtime}`;
+}
+
+function getThumbnailCacheKey(file) {
+  if (!file) return '';
+  return `thumb:v1:${getFingerprintBaseKey(file)}`;
+}
+
+function buildDuplicateFingerprintBaseKeys(files) {
+  const map = new Map();
+  for (const file of files || []) {
+    const base = getFingerprintBaseKey(file);
+    map.set(base, (map.get(base) || 0) + 1);
+  }
+  const duplicates = new Set();
+  for (const [base, count] of map) {
+    if (count > 1) duplicates.add(base);
+  }
+  return duplicates;
+}
+
+function fnv1a32(bytes, seed = 0x811c9dc5) {
+  let hash = seed >>> 0;
+  if (!bytes || !bytes.length) return hash >>> 0;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function compactExifForCache(exif) {
+  if (!exif || typeof exif !== 'object') return null;
+  const compact = {};
+  for (const key of CACHE_EXIF_KEYS) {
+    const value = exif[key];
+    if (value == null) continue;
+    compact[key] = value;
+  }
+  return Object.keys(compact).length ? compact : null;
+}
+
+function estimateScanCacheEntrySize(payload) {
+  if (!payload) return 64;
+  try {
+    return Math.max(96, JSON.stringify(payload).length * 2);
+  } catch {
+    return 256;
+  }
+}
+
+function idbRequest(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('idb request failed'));
+  });
+}
+
+function openThumbCacheDb() {
+  if (thumbCacheDisabled) return Promise.resolve(null);
+  if (thumbCacheDbPromise) return thumbCacheDbPromise;
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  thumbCacheDbPromise = new Promise((resolve) => {
+    let req;
+    try {
+      req = indexedDB.open(THUMB_CACHE_DB_NAME, THUMB_CACHE_DB_VERSION);
+    } catch {
+      thumbCacheDisabled = true;
+      resolve(null);
+      return;
+    }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      let store = null;
+      if (!db.objectStoreNames.contains(THUMB_CACHE_STORE)) {
+        store = db.createObjectStore(THUMB_CACHE_STORE, { keyPath: 'key' });
+      } else {
+        store = req.transaction?.objectStore(THUMB_CACHE_STORE) || null;
+      }
+      if (store && !store.indexNames.contains('touchedAt')) {
+        store.createIndex('touchedAt', 'touchedAt', { unique: false });
+      }
+      if (store && !store.indexNames.contains('size')) {
+        store.createIndex('size', 'size', { unique: false });
+      }
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        try { db.close(); } catch {}
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      thumbCacheDisabled = true;
+      resolve(null);
+    };
+    req.onblocked = () => {
+      thumbCacheDisabled = true;
+      resolve(null);
+    };
+  });
+  return thumbCacheDbPromise;
+}
+
+async function getThumbCacheStatsForBootLog() {
+  if (thumbCacheDisabled) return { items: 0, bytes: 0 };
+  const db = await openThumbCacheDb();
+  if (!db) return { items: 0, bytes: 0 };
+  try {
+    const tx = db.transaction(THUMB_CACHE_STORE, 'readonly');
+    const store = tx.objectStore(THUMB_CACHE_STORE);
+    const items = Number(await idbRequest(store.count())) || 0;
+    let bytes = 0;
+    if (store.indexNames.contains('size')) {
+      bytes = await new Promise((resolve) => {
+        let total = 0;
+        const req = store.index('size').openKeyCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve(total);
+            return;
+          }
+          total += Number(cursor.key) || 0;
+          cursor.continue();
+        };
+        req.onerror = () => resolve(0);
+      });
+    }
+    return { items, bytes: Number(bytes) || 0 };
+  } catch {
+    return { items: 0, bytes: 0 };
+  }
+}
+
+async function getThumbCacheBlob(cacheKey) {
+  if (!cacheKey || thumbCacheDisabled) return null;
+  const inFlight = thumbCacheReadInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+  const task = (async () => {
+  const db = await openThumbCacheDb();
+  if (!db) return null;
+  try {
+    const tx = db.transaction(THUMB_CACHE_STORE, 'readonly');
+    const store = tx.objectStore(THUMB_CACHE_STORE);
+    const rec = await idbRequest(store.get(cacheKey));
+    if (!rec || !rec.blob) return null;
+    // fire-and-forget touch; avoid blocking render path
+    void touchThumbCacheEntry(cacheKey, rec);
+    return rec.blob;
+  } catch {
+    return null;
+  }
+  })();
+  thumbCacheReadInFlight.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    if (thumbCacheReadInFlight.get(cacheKey) === task) {
+      thumbCacheReadInFlight.delete(cacheKey);
+    }
+  }
+}
+
+async function touchThumbCacheEntry(cacheKey, rec = null) {
+  if (!cacheKey || thumbCacheDisabled) return;
+  const db = await openThumbCacheDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(THUMB_CACHE_STORE, 'readwrite');
+    const store = tx.objectStore(THUMB_CACHE_STORE);
+    const current = rec || await idbRequest(store.get(cacheKey));
+    if (!current) return;
+    current.touchedAt = Date.now();
+    store.put(current);
+  } catch {}
+}
+
+function scheduleThumbCacheTrim(delay = 1500) {
+  if (thumbCacheTrimTimer) clearTimeout(thumbCacheTrimTimer);
+  thumbCacheTrimTimer = setTimeout(() => {
+    thumbCacheTrimTimer = null;
+    void trimThumbCacheNow();
+  }, Math.max(0, delay));
+}
+
+async function putThumbCacheBlob(cacheKey, blob, meta = {}) {
+  if (!cacheKey || !blob || thumbCacheDisabled) return;
+  const prev = thumbCacheWriteInFlight.get(cacheKey) || Promise.resolve();
+  const task = prev.catch(() => {}).then(async () => {
+    const db = await openThumbCacheDb();
+    if (!db) return;
+    try {
+      const now = Date.now();
+      const tx = db.transaction(THUMB_CACHE_STORE, 'readwrite');
+      const store = tx.objectStore(THUMB_CACHE_STORE);
+      store.put({
+        key: cacheKey,
+        blob,
+        size: Number(blob.size) || 0,
+        width: Number(meta.width) || 0,
+        height: Number(meta.height) || 0,
+        mime: String(blob.type || ''),
+        touchedAt: now,
+        updatedAt: now,
+      });
+      scheduleThumbCacheTrim();
+    } catch {}
+  });
+  thumbCacheWriteInFlight.set(cacheKey, task);
+  try {
+    await task;
+  } finally {
+    if (thumbCacheWriteInFlight.get(cacheKey) === task) {
+      thumbCacheWriteInFlight.delete(cacheKey);
+    }
+  }
+}
+
+async function deleteThumbCacheEntry(cacheKey) {
+  if (!cacheKey || thumbCacheDisabled) return;
+  const db = await openThumbCacheDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(THUMB_CACHE_STORE, 'readwrite');
+    const store = tx.objectStore(THUMB_CACHE_STORE);
+    store.delete(cacheKey);
+  } catch {}
+}
+
+async function trimThumbCacheNow() {
+  if (thumbCacheDisabled) return;
+  const db = await openThumbCacheDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(THUMB_CACHE_STORE, 'readonly');
+    const store = tx.objectStore(THUMB_CACHE_STORE);
+    const all = await idbRequest(store.getAll());
+    if (!Array.isArray(all) || !all.length) return;
+    let totalBytes = 0;
+    for (const rec of all) {
+      totalBytes += Number(rec?.size) || Number(rec?.blob?.size) || 0;
+    }
+    if (all.length <= THUMB_CACHE_MAX_ITEMS && totalBytes <= THUMB_CACHE_MAX_BYTES) return;
+    all.sort((a, b) => (Number(a?.touchedAt) || 0) - (Number(b?.touchedAt) || 0));
+    let count = all.length;
+    let bytes = totalBytes;
+    const deleteKeys = [];
+    for (const rec of all) {
+      if (count <= THUMB_CACHE_MAX_ITEMS && bytes <= THUMB_CACHE_MAX_BYTES) break;
+      const size = Number(rec?.size) || Number(rec?.blob?.size) || 0;
+      deleteKeys.push(rec.key);
+      count -= 1;
+      bytes = Math.max(0, bytes - size);
+    }
+    if (!deleteKeys.length) return;
+    const delTx = db.transaction(THUMB_CACHE_STORE, 'readwrite');
+    const delStore = delTx.objectStore(THUMB_CACHE_STORE);
+    for (const key of deleteKeys) delStore.delete(key);
+  } catch {}
+}
+
+function getScanCacheStorage() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const storage = window.localStorage;
+    const probeKey = '__lpv_scan_cache_probe__';
+    storage.setItem(probeKey, '1');
+    storage.removeItem(probeKey);
+    return storage;
+  } catch {
+    return null;
+  }
+}
+
+function persistScanResultCacheNow() {
+  const storage = getScanCacheStorage();
+  if (!storage) return;
+  const entries = Array.from(scanResultCache.entries()).map(([key, entry]) => ({
+    key,
+    payload: entry?.payload || null,
+    touchedAt: Number(entry?.touchedAt) || 0,
+    size: Number(entry?.size) || estimateScanCacheEntrySize(entry?.payload || null),
+  }));
+  entries.sort((a, b) => b.touchedAt - a.touchedAt);
+  const kept = [];
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (!entry.key || !entry.payload) continue;
+    if (kept.length >= SCAN_RESULT_CACHE_PERSIST_MAX_ITEMS) break;
+    const size = Number(entry.size) || estimateScanCacheEntrySize(entry.payload);
+    if (totalBytes + size > SCAN_RESULT_CACHE_PERSIST_MAX_BYTES) continue;
+    kept.push({
+      key: entry.key,
+      payload: entry.payload,
+      touchedAt: entry.touchedAt,
+      size,
+    });
+    totalBytes += size;
+  }
+
+  const writeSnapshot = (list) => {
+    const snapshot = {
+      version: SCAN_RESULT_CACHE_STORAGE_VERSION,
+      savedAt: Date.now(),
+      items: list,
+    };
+    storage.setItem(SCAN_RESULT_CACHE_STORAGE_KEY, JSON.stringify(snapshot));
+  };
+
+  try {
+    writeSnapshot(kept);
+  } catch {
+    // Quota/serialization failure: progressively shrink payload.
+    let fallback = kept.slice();
+    while (fallback.length > 16) {
+      fallback = fallback.slice(0, Math.max(16, Math.floor(fallback.length * 0.7)));
+      try {
+        writeSnapshot(fallback);
+        return;
+      } catch {}
+    }
+    try { storage.removeItem(SCAN_RESULT_CACHE_STORAGE_KEY); } catch {}
+  }
+}
+
+function schedulePersistScanResultCache(delay = 600) {
+  if (scanResultCachePersistTimer) {
+    clearTimeout(scanResultCachePersistTimer);
+  }
+  scanResultCachePersistTimer = setTimeout(() => {
+    scanResultCachePersistTimer = null;
+    persistScanResultCacheNow();
+  }, Math.max(0, delay));
+}
+
+function restoreScanResultCacheFromStorage() {
+  if (scanResultCacheLoaded) return;
+  scanResultCacheLoaded = true;
+  const storage = getScanCacheStorage();
+  if (!storage) return;
+  let parsed = null;
+  try {
+    const raw = storage.getItem(SCAN_RESULT_CACHE_STORAGE_KEY);
+    if (!raw) return;
+    parsed = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!parsed || Number(parsed.version) !== SCAN_RESULT_CACHE_STORAGE_VERSION) {
+    try { storage.removeItem(SCAN_RESULT_CACHE_STORAGE_KEY); } catch {}
+    return;
+  }
+  const items = Array.isArray(parsed.items) ? parsed.items : [];
+  if (!items.length) return;
+  items.sort((a, b) => (Number(a?.touchedAt) || 0) - (Number(b?.touchedAt) || 0));
+  for (const rec of items) {
+    const key = rec?.key;
+    const payload = rec?.payload;
+    if (!key || !payload || typeof payload !== 'object') continue;
+    const size = Number(rec?.size) || estimateScanCacheEntrySize(payload);
+    const touchedAt = Number(rec?.touchedAt) || Date.now();
+    scanResultCache.set(key, { payload, size, touchedAt });
+    scanResultCacheBytes += size;
+  }
+  evictScanResultCacheIfNeeded();
+}
+
+function logBootCacheRestoreSummary() {
+  const scan = {
+    items: scanResultCache.size,
+    bytes: scanResultCacheBytes,
+  };
+  const fallbackThumb = { items: 0, bytes: 0 };
+  void getThumbCacheStatsForBootLog()
+    .then((thumb) => {
+      console.log('[scan-cache] restore', { scan, thumb: thumb || fallbackThumb });
+    })
+    .catch(() => {
+      console.log('[scan-cache] restore', { scan, thumb: fallbackThumb });
+    });
+}
+
+function evictScanResultCacheIfNeeded() {
+  if (
+    scanResultCache.size <= SCAN_RESULT_CACHE_MAX_ITEMS
+    && scanResultCacheBytes <= SCAN_RESULT_CACHE_MAX_BYTES
+  ) return;
+  const entries = Array.from(scanResultCache.entries());
+  entries.sort((a, b) => (a[1].touchedAt || 0) - (b[1].touchedAt || 0));
+  for (const [key, entry] of entries) {
+    if (
+      scanResultCache.size <= SCAN_RESULT_CACHE_MAX_ITEMS
+      && scanResultCacheBytes <= SCAN_RESULT_CACHE_MAX_BYTES
+    ) break;
+    scanResultCache.delete(key);
+    scanResultCacheBytes = Math.max(0, scanResultCacheBytes - (entry.size || 0));
+  }
+}
+
+function setScanResultCache(fingerprint, analyzed) {
+  if (!fingerprint || !analyzed) return;
+  if (analyzed._notReadable) return;
+  const payload = {
+    isLive: !!analyzed.isLive,
+    liveType: analyzed.liveType || (analyzed.isLive ? 'Embedded Video' : 'Still'),
+    exif: compactExifForCache(analyzed.exif),
+    exifTime: analyzed.exifTime ?? null,
+    exifChecked: !!analyzed.exifChecked,
+    microOffset: Number.isFinite(analyzed._microVideoOffsetHint) ? analyzed._microVideoOffsetHint : null,
+    hasMotionTag: !!analyzed._hasMotionTagHint,
+    needsDeepScan: !!analyzed._needsDeepScanHint,
+    vendorType: analyzed._vendorTypeHint || null,
+  };
+  const size = estimateScanCacheEntrySize(payload);
+  const existing = scanResultCache.get(fingerprint);
+  if (existing) {
+    scanResultCacheBytes = Math.max(0, scanResultCacheBytes - (existing.size || 0));
+    scanResultCache.delete(fingerprint);
+  }
+  scanResultCache.set(fingerprint, { payload, size, touchedAt: Date.now() });
+  scanResultCacheBytes += size;
+  evictScanResultCacheIfNeeded();
+  schedulePersistScanResultCache();
+}
+
+function getScanResultCache(fingerprint) {
+  if (!fingerprint) return null;
+  const entry = scanResultCache.get(fingerprint);
+  if (!entry) return null;
+  entry.touchedAt = Date.now();
+  scanResultCache.delete(fingerprint);
+  scanResultCache.set(fingerprint, entry);
+  return entry.payload ? { ...entry.payload, exif: entry.payload.exif ? { ...entry.payload.exif } : null } : null;
+}
+
+restoreScanResultCacheFromStorage();
+logBootCacheRestoreSummary();
+
+async function buildQuickFileSignature(file) {
+  const size = Number(file?.size) || 0;
+  const headBuf = await readHeadBytes(file, Math.min(FINGERPRINT_SIG_BYTES, size || FINGERPRINT_SIG_BYTES));
+  const tailData = await readTailBytes(file, Math.min(FINGERPRINT_SIG_BYTES, size || FINGERPRINT_SIG_BYTES));
+  const head = new Uint8Array(headBuf || new ArrayBuffer(0));
+  const tail = new Uint8Array(tailData?.buffer || new ArrayBuffer(0));
+  const hashHead = fnv1a32(head);
+  const hashTail = fnv1a32(tail, hashHead ^ (size >>> 0));
+  return `${hashHead.toString(36)}-${hashTail.toString(36)}-${size.toString(36)}`;
+}
+
+async function buildFileFingerprint(file, duplicateBaseKeys = null) {
+  const base = getFingerprintBaseKey(file);
+  const hasRelativePath = !!String(file?.webkitRelativePath || '').trim();
+  const isDuplicateBase = duplicateBaseKeys ? duplicateBaseKeys.has(base) : false;
+  if (hasRelativePath && !isDuplicateBase) return base;
+  try {
+    const sig = await buildQuickFileSignature(file);
+    return `${base}|${sig}`;
+  } catch {
+    return base;
+  }
+}
+
+async function getOrBuildItemFingerprint(item, duplicateBaseKeys = null) {
+  if (!item?.file) return '';
+  if (item._scanFingerprint) return item._scanFingerprint;
+  if (item._scanFingerprintPromise) return await item._scanFingerprintPromise;
+  item._scanFingerprintPromise = buildFileFingerprint(item.file, duplicateBaseKeys)
+    .then((fp) => {
+      item._scanFingerprint = fp || '';
+      return item._scanFingerprint;
+    })
+    .finally(() => {
+      item._scanFingerprintPromise = null;
+    });
+  return await item._scanFingerprintPromise;
+}
+
+function applyCachedAnalyzePayload(target, payload, byBase = null) {
+  if (!target || !payload) return;
+  target.isLive = !!payload.isLive;
+  target.liveType = payload.liveType || (target.isLive ? 'Embedded Video' : 'Still');
+  target.exif = payload.exif ? { ...payload.exif } : (target.exif || null);
+  target.exifTime = payload.exifTime ?? target.exifTime ?? null;
+  target.exifChecked = payload.exifChecked || target.exifChecked;
+  target._microVideoOffsetHint = Number.isFinite(payload.microOffset) ? payload.microOffset : null;
+  target._hasMotionTagHint = !!payload.hasMotionTag;
+  target._needsDeepScanHint = !!payload.needsDeepScan;
+  target._vendorTypeHint = payload.vendorType || null;
+  if (target.isLive && !target.videoBlob && byBase) {
+    const base = target.name.replace(/\.[^/.]+$/, '').toLowerCase();
+    const siblings = byBase.get(base) || [];
+    const mov = siblings.find(f => f.name.toLowerCase().endsWith('.mov'));
+    if (mov) {
+      target.liveType = 'iOS Live Photo';
+      target.videoBlob = mov.type ? mov : new Blob([mov], { type: 'video/quicktime' });
+    }
+  }
+  target._cacheNeedsVideoHydration = !!(target.isLive && !target.videoBlob);
+  target._notReadable = false;
+  target._scanDone = true;
+}
+
+async function hydrateItemVideoBlobIfNeeded(item) {
+  if (!item || !item.isLive || item.videoBlob) return item?.videoBlob || null;
+  if (item._hydrateVideoPromise) return await item._hydrateVideoPromise;
+  item._hydrateVideoPromise = (async () => {
+    let blob = await extractEmbeddedVideoFromFile(item.file, item._microVideoOffsetHint ?? null);
+    if (!blob && (item._needsDeepScanHint || item._hasMotionTagHint || item._microVideoOffsetHint != null)) {
+      if (!platformInfo.isAndroid || item._hasMotionTagHint || item._microVideoOffsetHint != null) {
+        try {
+          const full = await item.file.arrayBuffer();
+          blob = extractEmbeddedVideo(full, item._microVideoOffsetHint);
+        } catch {}
+      }
+    }
+    if (blob) {
+      item.videoBlob = blob;
+      item._cacheNeedsVideoHydration = false;
+    }
+    return item.videoBlob || null;
+  })().finally(() => {
+    item._hydrateVideoPromise = null;
+  });
+  return await item._hydrateVideoPromise;
 }
 
 function applyVideoAudioState(video, muted) {
@@ -974,6 +1557,16 @@ function initViewer() {
       if (current && current.isLive && current.videoBlob) {
         console.debug('[viewer] auto-play live', { index: state.viewer.index, name: current.name });
         openLiveVideoInline(current);
+      } else if (current && current.isLive && !current.videoBlob) {
+        hydrateItemVideoBlobIfNeeded(current).then((blob) => {
+          if (!blob) return;
+          if (!state.viewer) return;
+          const active = state.filtered[state.viewer.index];
+          if (!active || active.id !== current.id) return;
+          updateLiveButton();
+          updateViewerPanel();
+          openLiveVideoInline(current);
+        }).catch(() => {});
       } else {
         console.debug('[viewer] non-live viewed', { index: state.viewer.index, name: current?.name });
       }
@@ -1085,6 +1678,16 @@ function openViewer(id) {
         updateLiveButton();
         updateViewerPanel();
       }
+    }).catch(() => {});
+  }
+  if (currentItem && currentItem.isLive && !currentItem.videoBlob) {
+    hydrateItemVideoBlobIfNeeded(currentItem).then((blob) => {
+      if (!blob) return;
+      if (!state.viewer) return;
+      const active = state.filtered[state.viewer.index];
+      if (!active || active.id !== currentItem.id) return;
+      updateLiveButton();
+      updateViewerPanel();
     }).catch(() => {});
   }
   state.currentViewerIndex = index;
@@ -3106,6 +3709,10 @@ function analyzeFile(file, byBase) {
     }
 
     try {
+      let vendorType = null;
+      let hasMotionTag = false;
+      let microOffset = null;
+      let needsDeepScan = false;
       const likelyByName = isLikelyLiveName(file.name);
       // Keep Android fast path smaller; use larger head on desktop for better vendor/exif coverage.
       const headReadSize = platformInfo.isAndroid ? 160 * 1024 : 512 * 1024;
@@ -3122,9 +3729,6 @@ function analyzeFile(file, byBase) {
         console.debug('[meta] exifr metadata', { name: file.name, hasXmp: !!xmp, exifKeys: Object.keys(exif).length });
       }
 
-      let vendorType = null;
-      let hasMotionTag = false;
-      let microOffset = null;
       if (xmp) {
         hasMotionTag = /MotionPhoto/i.test(xmp) || /MicroVideo/i.test(xmp);
         microOffset = parseXmpNumber(xmp, 'MicroVideoOffset');
@@ -3147,7 +3751,7 @@ function analyzeFile(file, byBase) {
       }
 
       let videoBlob = null;
-      const needsDeepScan = likelyLive || shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
+      needsDeepScan = likelyLive || shouldDeepScanForEmbeddedVideo(file, xmp, hasMotionTag, microOffset);
       if (needsDeepScan || microOffset != null) {
         videoBlob = await extractEmbeddedVideoFromFile(file, microOffset);
       }
@@ -3164,8 +3768,16 @@ function analyzeFile(file, byBase) {
         item.liveType = vendorType || (hasMotionTag ? 'Google Motion Photo' : 'Embedded Video');
         item.videoBlob = videoBlob;
       }
-    } catch {
-      // ignore
+      item._vendorTypeHint = vendorType || null;
+      item._hasMotionTagHint = !!hasMotionTag;
+      item._microVideoOffsetHint = Number.isFinite(microOffset) ? microOffset : null;
+      item._needsDeepScanHint = !!needsDeepScan;
+    } catch (err) {
+      const msg = err?.message || String(err || '');
+      if (/NotReadableError|permission/i.test(msg)) {
+        item._notReadable = true;
+      }
+      item._analyzeError = msg;
     }
     return item;
   })();
@@ -3290,79 +3902,98 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     }
   }
 
-  function renderThumbnailTask(item, card) {
-    return new Promise((resolve) => {
-      try {
-        const holder = card.querySelector('.thumb');
-        if (!holder || holder.querySelector('img')) {
-          resolve();
-          return;
-        }
-        const img = document.createElement('img');
-        img.loading = 'lazy';
-        img.decoding = 'async';
-        if (item.thumbUrl) {
-          img.src = item.thumbUrl;
-          holder.textContent = '';
-          holder.appendChild(img);
-          item.thumbLoaded = true;
-          resolve();
-          return;
-        }
+  async function renderThumbnailTask(item, card) {
+    try {
+      const holder = card.querySelector('.thumb');
+      if (!holder || holder.querySelector('img')) return;
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      if (item.thumbUrl) {
+        img.src = item.thumbUrl;
+        holder.textContent = '';
+        holder.appendChild(img);
+        item.thumbLoaded = true;
+        return;
+      }
 
-        const srcUrl = URL.createObjectURL(item.file);
-        const source = new Image();
-        source.decoding = 'async';
-        source.onload = () => {
-          const maxEdge = getThumbMaxEdge();
-          const sw = source.naturalWidth || source.width || 1;
-          const sh = source.naturalHeight || source.height || 1;
-          const scale = Math.min(1, maxEdge / Math.max(sw, sh));
-          const tw = Math.max(1, Math.round(sw * scale));
-          const th = Math.max(1, Math.round(sh * scale));
-          const canvas = document.createElement('canvas');
-          canvas.width = tw;
-          canvas.height = th;
-          const ctx = canvas.getContext('2d', { alpha: false });
-          if (ctx) {
-            ctx.drawImage(source, 0, 0, tw, th);
-            canvas.toBlob((blob) => {
-              URL.revokeObjectURL(srcUrl);
-              if (blob) {
-                item.thumbUrl = URL.createObjectURL(blob);
-              } else {
-                item.thumbUrl = URL.createObjectURL(item.file);
-              }
-              img.src = item.thumbUrl;
-              holder.textContent = '';
-              holder.appendChild(img);
-              item.thumbLoaded = true;
-              resolve();
-            }, 'image/jpeg', 0.78);
-          } else {
-            URL.revokeObjectURL(srcUrl);
+      const thumbCacheKey = getThumbnailCacheKey(item.file);
+      if (thumbCacheKey) {
+        const cachedBlob = await getThumbCacheBlob(thumbCacheKey);
+        if (cachedBlob && card.isConnected) {
+          item.thumbUrl = URL.createObjectURL(cachedBlob);
+          img.onerror = () => {
+            img.onerror = null;
+            if (item.thumbUrl) {
+              try { URL.revokeObjectURL(item.thumbUrl); } catch {}
+            }
             item.thumbUrl = URL.createObjectURL(item.file);
             img.src = item.thumbUrl;
-            holder.textContent = '';
-            holder.appendChild(img);
-            item.thumbLoaded = true;
-            resolve();
-          }
-        };
-        source.onerror = () => {
-          URL.revokeObjectURL(srcUrl);
-          item.thumbUrl = URL.createObjectURL(item.file);
+            void deleteThumbCacheEntry(thumbCacheKey);
+          };
           img.src = item.thumbUrl;
           holder.textContent = '';
           holder.appendChild(img);
           item.thumbLoaded = true;
-          resolve();
-        };
-        source.src = srcUrl;
-      } catch {
-        resolve();
+          return;
+        }
       }
-    });
+
+      const srcUrl = URL.createObjectURL(item.file);
+      const source = new Image();
+      source.decoding = 'async';
+      const loaded = await new Promise((resolve) => {
+        source.onload = () => resolve(true);
+        source.onerror = () => resolve(false);
+        source.src = srcUrl;
+      });
+      if (!loaded) {
+        URL.revokeObjectURL(srcUrl);
+        item.thumbUrl = URL.createObjectURL(item.file);
+        img.src = item.thumbUrl;
+        holder.textContent = '';
+        holder.appendChild(img);
+        item.thumbLoaded = true;
+        return;
+      }
+
+      const maxEdge = getThumbMaxEdge();
+      const sw = source.naturalWidth || source.width || 1;
+      const sh = source.naturalHeight || source.height || 1;
+      const scale = Math.min(1, maxEdge / Math.max(sw, sh));
+      const tw = Math.max(1, Math.round(sw * scale));
+      const th = Math.max(1, Math.round(sh * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = tw;
+      canvas.height = th;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) {
+        URL.revokeObjectURL(srcUrl);
+        item.thumbUrl = URL.createObjectURL(item.file);
+        img.src = item.thumbUrl;
+        holder.textContent = '';
+        holder.appendChild(img);
+        item.thumbLoaded = true;
+        return;
+      }
+      ctx.drawImage(source, 0, 0, tw, th);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.78));
+      URL.revokeObjectURL(srcUrl);
+      if (blob) {
+        item.thumbUrl = URL.createObjectURL(blob);
+        if (thumbCacheKey) {
+          void putThumbCacheBlob(thumbCacheKey, blob, { width: tw, height: th });
+        }
+      } else {
+        item.thumbUrl = URL.createObjectURL(item.file);
+      }
+      img.src = item.thumbUrl;
+      holder.textContent = '';
+      holder.appendChild(img);
+      item.thumbLoaded = true;
+    } catch {
+      // keep placeholder on failure
+    }
   }
 
   function ensureScanOverlay() {
@@ -3466,10 +4097,19 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     target.exif = analyzed.exif || target.exif || null;
     target.exifTime = analyzed.exifTime ?? target.exifTime ?? null;
     target.exifChecked = analyzed.exifChecked || target.exifChecked;
+    target._vendorTypeHint = analyzed._vendorTypeHint || target._vendorTypeHint || null;
+    target._hasMotionTagHint = !!(analyzed._hasMotionTagHint || target._hasMotionTagHint);
+    target._microVideoOffsetHint = Number.isFinite(analyzed._microVideoOffsetHint)
+      ? analyzed._microVideoOffsetHint
+      : (Number.isFinite(target._microVideoOffsetHint) ? target._microVideoOffsetHint : null);
+    target._needsDeepScanHint = !!(analyzed._needsDeepScanHint || target._needsDeepScanHint);
+    target._cacheNeedsVideoHydration = !!(target.isLive && !target.videoBlob);
+    target._notReadable = !!analyzed._notReadable;
+    target._analyzeError = analyzed._analyzeError || target._analyzeError || '';
     target._scanDone = true;
   }
 
-  async function progressiveAnalyzeItems(items, byBase, token, priorityIds = []) {
+  async function progressiveAnalyzeItems(items, byBase, token, priorityIds = [], duplicateBaseKeys = null) {
     const pending = items.filter(i => !i._scanDone);
     const prioritySet = new Set(priorityIds);
     const queue = [];
@@ -3491,11 +4131,15 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     const statusTick = platformInfo.isAndroid ? 6 : 24;
     const statTick = platformInfo.isAndroid ? 80 : 220;
     let cursor = 0;
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    let unreadableCount = 0;
 
     const updateProgress = (force = false) => {
       if (!force && done % statusTick !== 0) return;
       updateScanOverlay(done, total, 'Scanning');
-      setStatus(`Scanning ${done}/${total}... Live ${discoveredLive}`);
+      const unreadableText = unreadableCount ? ` · Unreadable ${unreadableCount}` : '';
+      setStatus(`Scanning ${done}/${total}... Live ${discoveredLive} · Cache ${cacheHits}/${cacheHits + cacheMisses}${unreadableText}`);
       if (force || done % statTick === 0) updateStats();
     };
 
@@ -3507,9 +4151,23 @@ function readTagValue(view, type, count, valueOffset, little, base) {
         const idx = cursor++;
         const item = queue[idx];
         const wasLive = item.isLive;
-        const analyzed = await analyzeFile(item.file, byBase);
+        const fingerprint = await getOrBuildItemFingerprint(item, duplicateBaseKeys);
+        const cached = getScanResultCache(fingerprint);
+        if (cached) {
+          applyCachedAnalyzePayload(item, cached, byBase);
+          cacheHits += 1;
+        } else {
+          const analyzed = await analyzeFile(item.file, byBase);
+          if (token !== activeScanToken) return;
+          mergeAnalyzedItem(item, analyzed);
+          if (analyzed._notReadable) {
+            unreadableCount += 1;
+          } else {
+            setScanResultCache(fingerprint, analyzed);
+          }
+          cacheMisses += 1;
+        }
         if (token !== activeScanToken) return;
-        mergeAnalyzedItem(item, analyzed);
         if (!wasLive && item.isLive) {
           syncCardLiveBadge(item);
         }
@@ -3525,6 +4183,15 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
     await Promise.all(workers);
     if (token !== activeScanToken) return;
+    console.log('[scan-cache] pass', {
+      hits: cacheHits,
+      misses: cacheMisses,
+      unreadable: unreadableCount,
+      cacheItems: scanResultCache.size,
+      cacheBytes: scanResultCacheBytes
+    });
+    // Flush cache snapshot after each scan pass to survive page reload.
+    persistScanResultCacheNow();
     updateProgress(true);
   }
 
@@ -3558,6 +4225,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     const byBase = await buildBaseMap(state.files);
     state.scanByBase = byBase;
     const queue = sortFilesForInitial(state.files.filter(isImageFile));
+    const duplicateBaseKeys = buildDuplicateFingerprintBaseKeys(queue);
     updateScanOverlay(0, Math.max(1, queue.length), 'Preparing');
     const placeholders = [];
     const chunk = platformInfo.isAndroid ? 80 : 900;
@@ -3578,7 +4246,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     const priorityIds = state.filtered
       .slice(0, platformInfo.isAndroid ? 120 : 320)
       .map(item => item.id);
-    await progressiveAnalyzeItems(state.items, byBase, token, priorityIds);
+    await progressiveAnalyzeItems(state.items, byBase, token, priorityIds, duplicateBaseKeys);
     if (token !== activeScanToken) return;
     if (state.filter !== 'all' || String(state.sortKey || '').startsWith('shot')) {
       renderGrid({ skipGallery: true });

@@ -1013,3 +1013,229 @@
   - 临时播放链路手动切换入口已下线，页面恢复正式默认链路行为。
 - 下一步：
   - 若你还要继续清理其它临时项（如调试日志前缀、MCP 专用提示文案），可按同口径逐项回滚。
+
+## 2026-02-18（TASK-PERF-CACHE-101 首版实现：fingerprint-v2 + 扫描结果缓存）
+- 背景：
+  - 用户要求继续 `TASK-PERF-CACHE-101`，并明确“若原建议文件指纹不合理，改用新方案”。
+  - 采用新指纹：`fingerprint-v2 = pathHint + size + lastModified`，在“无目录路径/同键冲突”时追加 `head/tail 4KB` 快速签名。
+- 改动：
+  1) `src/js/app.js` 增加扫描缓存层：
+     - 新增扫描结果缓存（LRU）：`scanResultCache` + 容量上限（条目/字节）。
+     - 新增缓存写入/读取/淘汰函数与体积估算。
+  2) 新增指纹生成链路：
+     - `buildDuplicateFingerprintBaseKeys(...)`
+     - `buildFileFingerprint(...)`
+     - `buildQuickFileSignature(...)`（FNV-1a，head/tail 4KB）
+  3) 扫描主流程接入缓存：
+     - 在 `progressiveAnalyzeItems(...)` 中先按指纹查缓存，命中直接复用 `isLive/liveType/exif/exifTime` 与偏移提示；
+     - 未命中走 `analyzeFile(...)`，再写回缓存；
+     - 状态提示增加缓存命中计数，输出 `[scan-cache] pass` 汇总日志。
+  4) 命中后按需补水：
+     - 新增 `hydrateItemVideoBlobIfNeeded(...)`；
+     - 在 `openViewer/viewed` 路径对“缓存命中但无 videoBlob”的 Live 项执行按需提取并回填。
+  5) `analyzeFile(...)` 增加可缓存提示字段：
+     - `_microVideoOffsetHint`、`_hasMotionTagHint`、`_needsDeepScanHint`、`_vendorTypeHint`。
+- 验证证据：
+  - 语法检查通过：`node --check src/js/app.js`。
+  - MCP 页面自动化双次同样本导入（6 文件）：
+    - 第一次：`[scan-cache] pass {"hits":0,"misses":6,"cacheItems":6,"cacheBytes":4640}`，耗时 `1420ms`。
+    - 第二次：`[scan-cache] pass {"hits":6,"misses":0,"cacheItems":6,"cacheBytes":4640}`，耗时 `979ms`。
+- 结果状态：
+  - `TASK-PERF-CACHE-101`：已完成首版实现，更新为 `待确认`。
+- 下一步：
+  1) 你在真实目录（>=100 文件）做两轮对比，确认“二次加载明显更快”。
+  2) 若你认可现口径，再进入 `TASK-PERF-ANDROID-102`。
+
+## 2026-02-18（TASK-PERF-CACHE-101 实目录回归：Windows Chrome，332 文件）
+- 背景：
+  - 用户指定目录：`E:\languoer\Pictures\我的照片`（300+ 文件），要求直接调用 Windows Chrome 测试。
+- 测试过程：
+  1) 通过页面目录输入注入目标目录，确认 `dirPicker.files=332`。
+  2) 重载后做“受控双次扫描”（同一批文件、同一会话）：
+     - 首轮：冷缓存；
+     - 二轮：热缓存。
+- 结果（页面自动化返回）：
+  - 文件输入：`332`
+  - 实际纳入扫描的图片项：`323`（其余为非图片或不在扫描集合）
+  - 首轮：`20229ms`
+  - 二轮：`997ms`
+  - 缓存日志：
+    - 首轮：`hits=0, misses=323, cacheItems=323, cacheBytes=230498`
+    - 二轮：`hits=323, misses=0, cacheItems=323, cacheBytes=230498`
+- 结论：
+  - 真实大目录下缓存命中与二次提速显著，满足当前 `TASK-PERF-CACHE-101` 验收口径（“二次加载明显更快，缓存体积可控”）。
+
+## 2026-02-18（TASK-PERF-CACHE-101 安卓本地目录复核：Chrome，323 图片）
+- 背景：
+  - 用户反馈：安卓 Chrome 手工测试中“第二次扫描未命中缓存”。
+  - 目标目录：`/storage/emulated/0/111我的文件/我的照片`（同批数据，323 图片）。
+- 调试链路：
+  1) ADB + Chrome DevTools 远程连接：
+     - `Android-Package: com.android.chrome`；
+     - 页面：`http://localhost:8080/live-photo-viewer/`。
+  2) 先验证 `mcpFiles` 场景（本地路径注入）：可稳定执行双轮扫描。
+  3) 再验证更贴近手工入口的 `filePicker` 场景（`source='file'`，每轮重新注入同目录文件）：
+     - 首轮（冷缓存）：`hits=0, misses=323`，`3048ms`；
+     - 二轮（热缓存）：`hits=323, misses=0`，`2024ms`；
+     - 抽样文件元信息（`name/size/lastModified`）两轮一致，`webkitRelativePath` 为空。
+- 结论：
+  - 在当前代码版本下，安卓 Chrome 本地目录二轮缓存命中正常。
+  - 用户此前“二轮未命中”更可能由环境因素触发（例如旧页面未刷新到最新脚本、会话重载导致内存缓存清空、或测试路径与入口不一致）。
+
+## 2026-02-18（安卓远程注入路径复核：NotReadable 防误判）
+- 背景：
+  - 用户反馈“我调用安卓目录后 323 张都打不开”，怀疑自动注入并未正确导入可读文件。
+- 复核结果：
+  1) 通过远程注入路径到 `filePicker/mcpFiles` 后，`File` 元信息存在（`name/size/type` 正常）。
+  2) 但读取文件内容时报错：
+     - `NotReadableError: The requested file could not be read ... permission problems`
+  3) 说明该注入方式在安卓上只拿到文件条目，不具备稳定读取权限，属于“不可读引用”。
+- 本轮修复（`src/js/app.js`）：
+  1) 不可读文件（`_notReadable`）不再写入扫描缓存，避免产生“假命中”。
+  2) 扫描状态增加 `Unreadable` 计数，`[scan-cache] pass` 增加 `unreadable` 字段。
+- 修复后验证（同样注入方式，323 图片）：
+  - 首轮：`hits=0, misses=323, unreadable=323, cacheItems=0`
+  - 二轮：`hits=0, misses=323, unreadable=323, cacheItems=0`
+- 结论：
+  - “323 张都打不开”问题已被复现并定位为安卓权限模型下的远程注入限制，不是你的观察误差。
+  - 缓存逻辑已加保护，不会再把不可读结果当作命中成功。
+
+## 2026-02-18（TASK-PERF-CACHE-101 修复：刷新后缓存不命中）
+- 背景：
+  - 用户反馈：Windows Chrome 刷新网页后会出现缓存不命中。
+  - 根因：此前扫描缓存仅驻留内存，刷新后 `scanResultCache` 被清空。
+- 改动（`src/js/app.js`）：
+  1) 增加扫描缓存持久化层（`localStorage`）：
+     - 键：`lpv.scan-cache.v2`，含版本号与快照时间；
+     - 启动时自动 `restore` 到内存缓存。
+  2) 增加持久化治理：
+     - 持久化上限：条目数 + 估算字节上限；
+     - 写入失败（如配额）时自动降级缩小快照。
+  3) 增加落盘时机：
+     - 每次扫描 pass 完成后立即落盘；
+     - `beforeunload` / `visibilitychange(hidden)` 时强制落盘。
+  4) 保留并兼容“不可读文件不入缓存”保护。
+- 验证证据（实机 CDP，扫描 -> 刷新 -> 再扫描）：
+  - 首轮：`hits=0, misses=6`；
+  - 刷新后次轮：`hits=6, misses=0`；
+  - 说明缓存已可跨刷新命中。
+- 结果状态：
+  - 刷新后缓存丢失问题已修复，`TASK-PERF-CACHE-101` 继续维持 `待确认`（待你用 Windows 大目录复验）。
+
+## 2026-02-18（任务池新增：Android 多选后索引与扫描提速）
+- 背景：
+  - 用户新增需求：安卓端多选文件后，索引和扫描整体仍偏慢，需要专项优化任务。
+- 改动：
+  1) `task.md` 新增任务 `TASK-PERF-ANDROID-104`（P1，待进行）。
+  2) 验收口径定义为：
+     - 安卓同目录（>=300 图）二次导入下，索引+扫描总耗时明显下降（目标 >=30%）；
+     - 过程中不引入“不可读文件误判缓存命中”回归。
+- 结果状态：
+  - 任务池已加入安卓性能专项任务，可在 `TASK-PERF-CACHE-101` 确认后继续执行。
+
+## 2026-02-18（TASK-PERF-THUMB-105 启动：缩略图持久化缓存）
+- 背景：
+  - 用户要求将“缩略图持久化缓存”从现有性能任务中拆解为独立任务，并开始实现。
+  - 为避免任务耦合，本轮将 `TASK-PERF-CACHE-101` 明确收敛为“扫描结果缓存”，缩略图缓存独立推进。
+- 状态更新：
+  1) `task.md`：
+     - 新增 `TASK-PERF-THUMB-105`（P1，`进行中`）。
+     - `TASK-PERF-CACHE-101` 任务名调整为“扫描结果缓存策略”。
+- 代码改动（`src/js/app.js`）：
+  1) 新增缩略图持久化缓存参数与运行状态：
+     - `THUMB_CACHE_DB_NAME/STORE/MAX_ITEMS/MAX_BYTES`；
+     - `thumbCacheDbPromise`、`thumbCacheTrimTimer`、`thumbCacheDisabled`。
+  2) 新增 IndexedDB 缓存能力：
+     - `openThumbCacheDb()`、`getThumbCacheBlob()`、`putThumbCacheBlob()`、`touchThumbCacheEntry()`；
+     - `trimThumbCacheNow()` + `scheduleThumbCacheTrim()`（按 LRU 和容量上限清理）。
+  3) 缩略图渲染链路接入缓存：
+     - `renderThumbnailTask(...)` 改为 `async`；
+     - 渲染前先读取持久化缓存，命中则直接显示；
+     - 未命中再生成 JPEG 缩略图，并异步回写缓存。
+- 验证证据：
+  1) 语法检查通过：`node --check src/js/app.js`。
+  2) 关键函数检索通过：`getThumbnailCacheKey/openThumbCacheDb/getThumbCacheBlob/putThumbCacheBlob/renderThumbnailTask` 已在源码可见。
+- 结果状态：
+  - `TASK-PERF-THUMB-105` 已进入实现阶段，当前可继续做实机回归（Windows/Android）验证“刷新后缩略图命中率与首屏耗时”。
+
+## 2026-02-18（TASK-PERF-CACHE-101 用户确认完成）
+- 背景：
+  - 用户明确指令：`TASK-PERF-CACHE-101` 已完成，并要求任务编号全流程不变。
+- 改动：
+  1) `task.md`：
+     - 将 `TASK-PERF-CACHE-101` 从“待确认”移动到“完成”分区。
+     - 备注补充“编号保持 `TASK-PERF-CACHE-101` 不变”。
+- 验证证据：
+  - `task.md` 中可见 `TASK-PERF-CACHE-101 | 完成`。
+- 结果状态：
+  - `TASK-PERF-CACHE-101`：`待确认 -> 完成`（编号未变更）。
+
+## 2026-02-18（TASK-PERF-THUMB-105 继续推进：缓存并发去重与坏缓存回退）
+- 背景：
+  - 用户要求继续推进 `TASK-PERF-THUMB-105`。
+  - 当前缩略图持久化缓存已可用，本轮重点补强大目录与异常场景稳定性。
+- 代码改动（`src/js/app.js`）：
+  1) 缩略图缓存读写并发去重：
+     - 新增 `thumbCacheReadInFlight` / `thumbCacheWriteInFlight`。
+     - `getThumbCacheBlob(...)` 对同一 key 复用同一读取 Promise，避免并发重复读。
+     - `putThumbCacheBlob(...)` 对同一 key 串行写入，避免并发写冲突。
+  2) 坏缓存自动剔除与回退：
+     - 新增 `deleteThumbCacheEntry(...)`。
+     - 缓存命中渲染时若 `img.onerror`，自动删除该 key 的持久化缓存并回退到原图 URL，避免后续重复命中坏缓存。
+- 验证证据：
+  1) 语法检查通过：`node --check src/js/app.js`。
+  2) 关键符号可检索：
+     - `thumbCacheReadInFlight` / `thumbCacheWriteInFlight`
+     - `deleteThumbCacheEntry`
+     - 缓存命中分支 `img.onerror` 回退逻辑。
+  3) Windows Chrome（MCP）回归：
+     - 刷新后导入 6 张样本图，`scanDone=true`、`thumbsReady=true`。
+     - IndexedDB `lpv-thumb-cache/thumbs` 可见持久化记录（测试时 `count=348`，`bytes=7075938`）。
+     - 控制台仅 `favicon.ico 404`，未出现新增 JS 异常。
+- 结果状态：
+  - `TASK-PERF-THUMB-105` 维持 `进行中`，已进入稳定性增强阶段。
+
+## 2026-02-18（TASK-PERF-THUMB-105 容量参数调优：面向 2 万图场景）
+- 背景：
+  - 用户确认按“约 2 万张图片”目标场景提升缓存容量上限。
+- 改动（`src/js/app.js`）：
+  1) 扫描结果缓存（内存）：
+     - `SCAN_RESULT_CACHE_MAX_ITEMS: 1800 -> 6000`
+     - `SCAN_RESULT_CACHE_MAX_BYTES: 32MB -> 64MB`
+  2) 扫描结果持久化（localStorage）：
+     - `SCAN_RESULT_CACHE_PERSIST_MAX_ITEMS: 1200 -> 2500`
+     - `SCAN_RESULT_CACHE_PERSIST_MAX_BYTES: 2MB -> 3MB`
+  3) 缩略图持久化缓存（IndexedDB）：
+     - `THUMB_CACHE_MAX_ITEMS: 5000 -> 12000`
+     - `THUMB_CACHE_MAX_BYTES: 180MB -> 320MB`
+- 同步更新：
+  - `task.md` 中 `TASK-PERF-THUMB-105` 备注已加入本次容量调优参数，任务状态保持 `进行中`。
+- 验证证据：
+  1) 语法检查通过：`node --check src/js/app.js`。
+  2) 常量检索通过：6 个目标常量值均已更新。
+- 结果状态：
+  - 容量参数调优已落地，后续可继续做 Windows/Android 大目录回归，确认命中率与稳定性。
+
+## 2026-02-18（TASK-PERF-THUMB-105 启动日志增强：统一输出 scan+thumb 恢复统计）
+- 背景：
+  - 用户要求将“扫描结果持久化缓存（localStorage）+ 缩略图持久化缓存（IndexedDB）”都加入启动最开始的恢复日志。
+- 改动（`src/js/app.js`）：
+  1) 启动恢复日志改为统一结构：
+     - 新增 `logBootCacheRestoreSummary()`，输出：
+       - `scan.items/scan.bytes`（扫描结果缓存）
+       - `thumb.items/thumb.bytes`（缩略图持久化缓存）
+  2) 新增 `getThumbCacheStatsForBootLog()`：
+     - 启动时读取 IndexedDB `thumbs` 表统计；
+     - 使用 `size` 索引的 `openKeyCursor()` 累加字节，避免读取全部 blob。
+  3) IndexedDB 版本升级：
+     - `THUMB_CACHE_DB_VERSION: 1 -> 2`
+     - 升级逻辑补建 `size` 索引（若不存在）。
+  4) 原有仅 `scan` 的启动日志已替换为统一日志。
+- 验证证据：
+  1) 语法检查通过：`node --check src/js/app.js`。
+  2) 关键符号可检索：
+     - `getThumbCacheStatsForBootLog`
+     - `logBootCacheRestoreSummary`
+     - `console.log('[scan-cache] restore', { scan, thumb ... })`
+- 结果状态：
+  - 启动时可一次性看到两类持久化缓存恢复统计，便于统一观测与调试。

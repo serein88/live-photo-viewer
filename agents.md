@@ -1,4 +1,4 @@
-﻿# Agents.md
+# AGENTS.md
 
 ## 1) 项目目标与用途
 - 项目：`live-photo-viewer`
