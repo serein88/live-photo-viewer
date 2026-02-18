@@ -26,6 +26,8 @@ const FFMPEG_WORKER_PATH = 'vendor/ffmpeg-core.worker.js';
 const FFMPEG_CORE_MAIN_NAME = 'main';
 const FFMPEG_ASSET_VERSION = 'core-st-20260218-1';
 const ENABLE_VERBOSE_DEBUG_LOGS = typeof window !== 'undefined' && !!window.__LPV_VERBOSE_DEBUG__;
+const DERIVED_VIDEO_CACHE_MAX_ITEMS = 24;
+const DERIVED_VIDEO_CACHE_MAX_BYTES = 220 * 1024 * 1024;
 const MUTED_DEBUG_PREFIXES = Object.freeze([
   '[viewer]',
   '[viewer-nav]',
@@ -63,6 +65,8 @@ let mp4BoxModulePromise = null;
 let ffmpegInstancePromise = null;
 let ffmpegRunQueue = Promise.resolve();
 let ffmpegUnavailableLogged = false;
+let derivedVideoCacheBytes = 0;
+const derivedVideoCacheRecords = [];
 const VIEWER_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
 const IMAGE_EXTS = new Set(['jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','avif']);
 const VIDEO_EXTS = new Set(['mp4','mov','m4v','3gp','webm','mkv','avi']);
@@ -278,6 +282,74 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+function removeDerivedCacheRecordByKey(key) {
+  const idx = derivedVideoCacheRecords.findIndex((r) => r.key === key);
+  if (idx < 0) return;
+  const rec = derivedVideoCacheRecords[idx];
+  derivedVideoCacheRecords.splice(idx, 1);
+  derivedVideoCacheBytes = Math.max(0, derivedVideoCacheBytes - (rec.size || 0));
+}
+
+function trackDerivedVideoBlob(item, field, blob) {
+  if (!item || !item.id || !field) return;
+  const key = `${item.id}:${field}`;
+  removeDerivedCacheRecordByKey(key);
+  item[field] = blob || null;
+  if (!blob || !blob.size) return;
+  derivedVideoCacheRecords.push({
+    key,
+    item,
+    field,
+    size: blob.size,
+    touchedAt: Date.now(),
+  });
+  derivedVideoCacheBytes += blob.size;
+  evictDerivedVideoCacheIfNeeded();
+}
+
+function evictDerivedVideoCacheIfNeeded() {
+  if (
+    derivedVideoCacheRecords.length <= DERIVED_VIDEO_CACHE_MAX_ITEMS
+    && derivedVideoCacheBytes <= DERIVED_VIDEO_CACHE_MAX_BYTES
+  ) return;
+  const activeId = state.viewer && state.filtered && state.filtered[state.viewer.index]
+    ? state.filtered[state.viewer.index].id
+    : '';
+  let guard = 0;
+  while (
+    (derivedVideoCacheRecords.length > DERIVED_VIDEO_CACHE_MAX_ITEMS || derivedVideoCacheBytes > DERIVED_VIDEO_CACHE_MAX_BYTES)
+    && derivedVideoCacheRecords.length
+    && guard < 200
+  ) {
+    guard += 1;
+    derivedVideoCacheRecords.sort((a, b) => (a.touchedAt || 0) - (b.touchedAt || 0));
+    const rec = derivedVideoCacheRecords[0];
+    if (!rec) break;
+    if (activeId && rec.item?.id === activeId && state.livePlaying) {
+      rec.touchedAt = Date.now();
+      continue;
+    }
+    derivedVideoCacheRecords.shift();
+    derivedVideoCacheBytes = Math.max(0, derivedVideoCacheBytes - (rec.size || 0));
+    if (rec.item) {
+      rec.item[rec.field] = null;
+    }
+  }
+}
+
+function dropDerivedVideoCaches(items = state.items) {
+  const list = Array.isArray(items) ? items : [];
+  for (const item of list) {
+    if (!item) continue;
+    item._audioStrippedBlob = null;
+    item._audioStrippedBlobFfmpeg = null;
+    item._audioStrippedBlobFfmpegPromise = null;
+    item._trackInfoStripped = null;
+  }
+  derivedVideoCacheRecords.length = 0;
+  derivedVideoCacheBytes = 0;
+}
+
 function applyVideoAudioState(video, muted) {
   if (!video) return;
   const isMuted = !!muted;
@@ -421,6 +493,7 @@ async function startScan() {
   state.scanning = true;
   setStatus('扫描中...');
   if (state.items.length) {
+    dropDerivedVideoCaches(state.items);
     state.items.forEach((item) => {
       if (item.objectUrl) {
         URL.revokeObjectURL(item.objectUrl);
@@ -1585,7 +1658,7 @@ async function openLiveVideoInline(item) {
       }
       forcedBBlob = await item._audioStrippedBlobFfmpegPromise;
       if (!isCurrentPlayback()) return;
-      if (forcedBBlob) item._audioStrippedBlobFfmpeg = forcedBBlob;
+      if (forcedBBlob) trackDerivedVideoBlob(item, '_audioStrippedBlobFfmpeg', forcedBBlob);
     }
     if (forcedBBlob) {
       item._audioStrippedBlob = forcedBBlob;
@@ -1674,7 +1747,7 @@ async function openLiveVideoInline(item) {
         stripped = await stripMp4AudioTrack(item.videoBlob, { itemName: item.name });
         if (stripped) {
           console.debug('[live-debug] strip audio retry', { name: item.name, reason, before: item.videoBlob.size, after: stripped.size });
-          item._audioStrippedBlob = stripped;
+          trackDerivedVideoBlob(item, '_audioStrippedBlob', stripped);
         } else {
           console.debug('[live-debug] strip audio skipped', { name: item.name, reason });
         }
@@ -1736,7 +1809,7 @@ async function openLiveVideoInline(item) {
       console.warn('[ffmpeg-fallback] trigger after sanitized play failed', { name: item.name, reason });
       const ffmpegStripped = await stripMp4AudioTrackWithFfmpeg(item.videoBlob, item.name);
       if (!ffmpegStripped || !isCurrentPlayback()) return false;
-      item._audioStrippedBlob = ffmpegStripped;
+      trackDerivedVideoBlob(item, '_audioStrippedBlob', ffmpegStripped);
       played = await playSanitizedBlob(ffmpegStripped, 'ffmpeg', true);
       return played;
     })();
@@ -3495,6 +3568,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
     if (state.items.length) {
+      dropDerivedVideoCaches(state.items);
       state.items.forEach((item) => {
         if (item.objectUrl) {
           URL.revokeObjectURL(item.objectUrl);
