@@ -10,7 +10,7 @@
   livePathMode: 'auto',
   layout: 'auto',
   scanning: false,
-  sortKey: 'mtime_desc',
+  sortKey: 'shot_desc',
   exifQueueRunning: false,
   userAdjusted: false,
   viewerUrlCache: new Map(),
@@ -123,6 +123,16 @@ const el = {
   sortSelect: document.getElementById('sortSelect'),
   viewerGallery: document.getElementById('viewerGallery'),
 };
+
+function syncInitialSortKeyFromSelect() {
+  const preferred = String(el.sortSelect?.value || '').trim();
+  const key = preferred || 'shot_desc';
+  state.sortKey = key;
+  if (el.sortSelect && el.sortSelect.value !== key) {
+    el.sortSelect.value = key;
+  }
+}
+syncInitialSortKeyFromSelect();
 
 let gridBound = false;
 function bindGridEvents() {
@@ -1329,7 +1339,7 @@ function applySort(list) {
 }
 
 function buildGroups(sorted) {
-  const key = state.sortKey || (el.sortSelect ? el.sortSelect.value : 'mtime_desc');
+  const key = state.sortKey || (el.sortSelect ? el.sortSelect.value : 'shot_desc');
   const type = key.split('_')[0];
   if (type !== 'mtime' && type !== 'shot') {
     return sorted.map(item => ({ type: 'item', item }));
@@ -3839,7 +3849,7 @@ function readTagValue(view, type, count, valueOffset, little, base) {
   }
 
   function sortFilesForInitial(files) {
-    const key = state.sortKey || (el.sortSelect ? el.sortSelect.value : 'mtime_desc');
+    const key = state.sortKey || (el.sortSelect ? el.sortSelect.value : 'shot_desc');
     const list = files.slice();
     const cmpNum = (a, b, desc = true) => desc ? (b - a) : (a - b);
     if (key === 'name_asc' || key === 'name_desc') {

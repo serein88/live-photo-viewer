@@ -1239,3 +1239,48 @@
      - `console.log('[scan-cache] restore', { scan, thumb ... })`
 - 结果状态：
   - 启动时可一次性看到两类持久化缓存恢复统计，便于统一观测与调试。
+
+## 2026-02-18（TASK-PERF-THUMB-105 用户确认完成）
+- 背景：
+  - 用户明确指令：`TASK-PERF-THUMB-105` 完成。
+- 改动：
+  1) `task.md`：
+     - `TASK-PERF-THUMB-105` 从“进行中”移动到“完成”分区。
+- 验证证据：
+  - `task.md` 中可见 `TASK-PERF-THUMB-105 | 完成`。
+- 结果状态：
+  - `TASK-PERF-THUMB-105`：`进行中 -> 完成`。
+
+## 2026-02-18（TASK-SORT-305 实现：默认排序改为拍摄时间新->旧）
+- 背景：
+  - 用户要求继续下一任务 `TASK-SORT-305`。
+- 代码改动（`src/js/app.js`）：
+  1) 默认排序键调整：
+     - `state.sortKey: 'mtime_desc' -> 'shot_desc'`。
+  2) 初始化同步：
+     - 新增 `syncInitialSortKeyFromSelect()`，启动时同步 `state.sortKey` 与 `#sortSelect`，确保首轮扫描前即采用默认拍摄时间排序策略。
+  3) 兜底值统一：
+     - `buildGroups(...)` 与 `sortFilesForInitial(...)` 的 fallback 统一改为 `shot_desc`。
+- 验证证据：
+  1) 语法检查通过：`node --check src/js/app.js`。
+  2) 页面初始化检查（MCP，刷新后）：
+     - `state.sortKey = 'shot_desc'`
+     - `#sortSelect.value = 'shot_desc'`
+  3) 样本导入检查（MCP，6 文件）：
+     - 扫描完成后 `sortKey/sortSelect` 仍为 `shot_desc`。
+     - `applySort(state.filtered)` 头部样本时间序列为非递增（`nonIncreasing=true`）。
+- 状态更新：
+  - `task.md`：`TASK-SORT-305` 从“待进行”更新为“待确认”。
+- 结果状态：
+  - `TASK-SORT-305` 已完成实现并通过基础回归，待你确认后可转“完成”。
+
+## 2026-02-18（TASK-SORT-305 用户确认完成）
+- 背景：
+  - 用户明确指令：`TASK-SORT-305` 从“待确认”转“完成”。
+- 改动：
+  1) `task.md`：
+     - 将 `TASK-SORT-305` 从“待确认”移动到“完成”分区。
+- 验证证据：
+  - `task.md` 中可见 `TASK-SORT-305 | 完成`。
+- 结果状态：
+  - `TASK-SORT-305`：`待确认 -> 完成`。
